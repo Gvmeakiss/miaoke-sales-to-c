@@ -33,6 +33,7 @@ def extract_order_items(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str,
     header = BASE.read_header(path)
     fields = {
         "order_no": BASE.header_index(header, "订单编号"),
+        "platform_order_no": BASE.header_index(header, "原始单号"),
         "sap_code": BASE.header_index(header, "SAP编码"),
         "product_code": BASE.header_index(header, "货品编号"),
         "unit": BASE.header_index(header, "单位"),
@@ -42,7 +43,7 @@ def extract_order_items(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str,
     selected = sorted({c for c in fields.values() if c})
     cache.parent.mkdir(parents=True, exist_ok=True)
     current_order = ""
-    aggregates: Dict[Tuple[str, str, str], list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
+    aggregates: Dict[Tuple[str, str, str, str], list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
     emitted = 0
 
     def value(values, key):
@@ -54,8 +55,8 @@ def extract_order_items(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str,
 
         def emit():
             nonlocal emitted
-            for (order_no, material_key, unit), nums in aggregates.items():
-                writer.writerow([order_no, material_key, unit, nums[0], nums[1], int(nums[2])])
+            for (order_no, platform_order_no, material_key, unit), nums in aggregates.items():
+                writer.writerow([order_no, platform_order_no, material_key, unit, nums[0], nums[1], int(nums[2])])
                 emitted += 1
             aggregates.clear()
 
@@ -71,7 +72,7 @@ def extract_order_items(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str,
             material = sap or ("SKU:" + product if product else "")
             if not material:
                 continue
-            key = (order_no, material, value(values, "unit"))
+            key = (order_no, value(values, "platform_order_no"), material, value(values, "unit"))
             aggregates[key][0] += BASE.as_number(value(values, "quantity"))
             aggregates[key][1] += BASE.as_number(value(values, "amount"))
             aggregates[key][2] += 1
@@ -82,10 +83,10 @@ def extract_order_items(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str,
 def load_order_items(conn: sqlite3.Connection, input_dir: Path, work_dir: Path, workers: int, max_rows: Optional[int]) -> None:
     conn.executescript("""
     DROP TABLE IF EXISTS wdt_order_item_stage;
-    CREATE TABLE wdt_order_item_stage(order_no TEXT,material_key TEXT,unit TEXT,quantity REAL,amount REAL,line_count INTEGER);
+    CREATE TABLE wdt_order_item_stage(source_file TEXT,order_no TEXT,platform_order_no TEXT,material_key TEXT,unit TEXT,quantity REAL,amount REAL,line_count INTEGER);
     """)
     files = BASE.wdt_files(input_dir)
-    cache_dir = work_dir / "wdt_order_item_cache"
+    cache_dir = work_dir / "wdt_order_item_platform_cache"
     tasks = [(str(p), str(cache_dir / f"{i:02d}_{p.stem}.csv"), max_rows) for i, p in enumerate(files, 1)]
     results = []
     with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
@@ -97,22 +98,33 @@ def load_order_items(conn: sqlite3.Connection, input_dir: Path, work_dir: Path, 
         batch = []
         with Path(cache).open("r", encoding="utf-8", newline="") as stream:
             for row in csv.reader(stream):
-                batch.append((row[0], row[1], row[2], float(row[3]), float(row[4]), int(row[5])))
+                batch.append((name,row[0],row[1],row[2],row[3],float(row[4]),float(row[5]),int(row[6])))
                 if len(batch) >= 50000:
-                    conn.executemany("INSERT INTO wdt_order_item_stage VALUES(?,?,?,?,?,?)", batch); conn.commit(); batch.clear()
+                    conn.executemany("INSERT INTO wdt_order_item_stage VALUES(?,?,?,?,?,?,?,?)", batch); conn.commit(); batch.clear()
             if batch:
-                conn.executemany("INSERT INTO wdt_order_item_stage VALUES(?,?,?,?,?,?)", batch); conn.commit()
+                conn.executemany("INSERT INTO wdt_order_item_stage VALUES(?,?,?,?,?,?,?,?)", batch); conn.commit()
         print(f"订单物料入库 {name}", flush=True)
     conn.executescript("""
     DROP TABLE IF EXISTS wdt_order_item;
     CREATE TABLE wdt_order_item AS
-    SELECT s.order_no,
+    WITH chosen_source AS (
+      SELECT source_file,order_no,platform_order_no,
+        ROW_NUMBER() OVER (
+          PARTITION BY order_no,platform_order_no
+          ORDER BY quantity DESC,line_count DESC,ship_time DESC,source_file DESC
+        ) source_rank
+      FROM wdt_orders_file
+    )
+    SELECT s.order_no,s.platform_order_no,
       CASE WHEN s.material_key LIKE 'SKU:%' THEN COALESCE(m.sap_code,s.material_key) ELSE s.material_key END material_code,
       s.unit,SUM(s.quantity) quantity,SUM(s.amount) amount,SUM(s.line_count) line_count
     FROM wdt_order_item_stage s
+    JOIN chosen_source c ON c.source_file=s.source_file AND c.order_no=s.order_no
+      AND c.platform_order_no=s.platform_order_no AND c.source_rank=1
     LEFT JOIN wdt_product_sap_best m ON substr(s.material_key,5)=m.product_code
-    GROUP BY 1,2,3;
-    CREATE INDEX idx_wdt_order_item_order ON wdt_order_item(order_no);
+    GROUP BY 1,2,3,4;
+    CREATE INDEX idx_wdt_order_item_order ON wdt_order_item(order_no,platform_order_no);
+    CREATE INDEX idx_wdt_order_item_platform ON wdt_order_item(platform_order_no);
     """)
     conn.commit()
 
@@ -183,7 +195,8 @@ def build_reconciliation(conn: sqlite3.Connection) -> dict:
     CREATE TABLE wdt_platform_order_item AS
     SELECT d.platform_order_no,substr(d.ship_time,1,7) ship_month,d.shop,i.material_code,i.unit,
       SUM(i.quantity) wdt_qty,SUM(i.amount) wdt_amount,SUM(i.line_count) wdt_lines
-    FROM wdt_order_dedup d JOIN wdt_order_item i ON i.order_no=d.order_no
+    FROM wdt_order_dedup d JOIN wdt_order_item i
+      ON i.order_no=d.order_no AND i.platform_order_no=d.platform_order_no
     WHERE d.platform_order_no<>'' AND substr(d.ship_time,1,7) BETWEEN '2025-12' AND '2026-06'
     GROUP BY 1,2,3,4,5;
     CREATE INDEX idx_wdt_platform_order_item_order ON wdt_platform_order_item(platform_order_no);
@@ -379,9 +392,9 @@ def export_outputs(conn: sqlite3.Connection, output_dir: Path, stats: dict) -> N
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, default=ROOT.parent / "input")
-    parser.add_argument("--db", type=Path, default=ROOT / "work_full" / "reconciliation.db")
-    parser.add_argument("--work", type=Path, default=ROOT / "work_full")
-    parser.add_argument("--output", type=Path, default=ROOT / "output_huice_oms")
+    parser.add_argument("--db", type=Path, default=ROOT / "work" / "reconciliation.db")
+    parser.add_argument("--work", type=Path, default=ROOT / "work")
+    parser.add_argument("--output", type=Path, default=ROOT / "intermediate" / "huice_oms")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--reuse-order-items", action="store_true")

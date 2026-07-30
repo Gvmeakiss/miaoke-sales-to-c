@@ -386,9 +386,9 @@ def build_candidates(connection: sqlite3.Connection, output_dir: Path) -> Dict[s
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, default=ROOT.parent / "input")
-    parser.add_argument("--database", type=Path, default=ROOT / "work_full" / "reconciliation.db")
-    parser.add_argument("--work", type=Path, default=ROOT / "work_full")
-    parser.add_argument("--output", type=Path, default=ROOT / "output_flow_exploration")
+    parser.add_argument("--database", type=Path, default=ROOT / "work" / "reconciliation.db")
+    parser.add_argument("--work", type=Path, default=ROOT / "work")
+    parser.add_argument("--output", type=Path, default=ROOT / "intermediate" / "exploration")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-rows-per-file", type=int)
     parser.add_argument("--reuse-wdt", action="store_true")

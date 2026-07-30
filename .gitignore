@@ -48,5 +48,9 @@ OutPut/
 cache/
 input/
 .codex_tmp/
-reconciliation/work*/
-reconciliation/output*/
+node_modules/
+reconciliation/node_modules
+reconciliation/work/
+reconciliation/results/
+reconciliation/intermediate/
+reconciliation/qa_previews/
