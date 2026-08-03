@@ -91,6 +91,50 @@ def normalize_shop(value: str) -> str:
     return re.sub(r"抖音|抖店|快手|小店|天猫|淘宝|京东|拼多多|微信|视频号|小红书|店铺", "", value)
 
 
+def normalize_shop_id(value: str) -> str:
+    """清理旺店通导出中常见的 Excel 文本格式，例如 =\"819205\"。"""
+    value = str(value or "").strip()
+    if value.startswith('="') and value.endswith('"'):
+        value = value[2:-1]
+    return value.strip().strip('"').strip()
+
+
+def load_wdt_shop_master(connection: sqlite3.Connection, input_dir: Path) -> int:
+    """加载旺店通店铺 ID 主数据；文件不存在时保留空表，名称/交易逻辑继续兜底。"""
+    connection.executescript("""
+    DROP TABLE IF EXISTS wdt_shop_master;
+    CREATE TABLE wdt_shop_master(
+      shop_id TEXT, shop_name TEXT PRIMARY KEY, auth_status TEXT, platform_account TEXT,
+      platform TEXT, sub_platform TEXT, enabled_status TEXT, fetch_status TEXT
+    );
+    """)
+    path = input_dir / "旺店通内店铺id与店铺名称映射.csv"
+    if not path.exists():
+        print(f"未找到旺店通店铺主数据，使用现有名称/交易匹配兜底：{path}", flush=True)
+        return 0
+    inserted = 0
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        rows = []
+        for row in reader:
+            shop_id = normalize_shop_id(row.get("店铺编号", ""))
+            shop_name = str(row.get("店铺名称", "") or "").strip()
+            if not shop_id or not shop_name:
+                continue
+            rows.append((shop_id, shop_name, row.get("店铺授权状态", ""),
+                         row.get("平台帐号", ""), row.get("平台", ""),
+                         row.get("子平台", ""), row.get("启用状态", ""),
+                         row.get("抓单状态", "")))
+        connection.executemany(
+            "INSERT OR IGNORE INTO wdt_shop_master VALUES(?,?,?,?,?,?,?,?)", rows
+        )
+        inserted = connection.execute("SELECT COUNT(*) FROM wdt_shop_master").fetchone()[0]
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_wdt_shop_master_id ON wdt_shop_master(shop_id)")
+    connection.commit()
+    print(f"加载旺店通店铺 ID 主数据 {inserted:,} 条：{path.name}", flush=True)
+    return inserted
+
+
 def platform(value: str) -> str:
     for token, canonical in [
         ("抖", "抖音"), ("快手", "快手"), ("天猫", "天猫"), ("淘宝", "天猫"),
@@ -198,11 +242,35 @@ def build_candidates(connection: sqlite3.Connection, output_dir: Path) -> Dict[s
     connection.executemany("INSERT INTO wdt_oms_shop_candidates VALUES(?,?,?,?,?,?,?,?,?)", candidates)
     connection.executescript("""
     DROP TABLE IF EXISTS wdt_oms_shop_map;
+    DROP TABLE IF EXISTS wdt_oms_shop_official;
+    CREATE TABLE wdt_oms_shop_official AS
+    SELECT sm.shop_id customer_code,MIN(cm.customer_name) customer_name,sm.shop_name wdt_shop,
+      1.0 name_score,1.0 vector_score,1.0 platform_score,1.0 total_score,
+      '高置信' mapping_status,'旺店通店铺ID主数据' mapping_source,
+      sm.shop_id wdt_shop_id,sm.platform wdt_platform,sm.auth_status wdt_auth_status
+    FROM wdt_shop_master sm
+    JOIN (SELECT DISTINCT shop FROM wdt_item WHERE shop<>'') ws ON ws.shop=sm.shop_name
+    JOIN (SELECT customer_code,MIN(customer_name) customer_name FROM oms_detail GROUP BY customer_code) cm
+      ON cm.customer_code=sm.shop_id
+    GROUP BY sm.shop_id,sm.shop_name,sm.platform,sm.auth_status;
+
     CREATE TABLE wdt_oms_shop_map AS
-    WITH r AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY customer_code ORDER BY total_score DESC,wdt_shop) rn FROM wdt_oms_shop_candidates)
-    SELECT customer_code,customer_name,wdt_shop,name_score,vector_score,platform_score,total_score,
-      CASE WHEN total_score>=0.72 THEN '高置信' WHEN total_score>=0.55 THEN '待复核' ELSE '低置信' END mapping_status
-    FROM r WHERE rn=1;
+    WITH r AS (
+      SELECT *,ROW_NUMBER() OVER(PARTITION BY customer_code ORDER BY total_score DESC,wdt_shop) rn
+      FROM wdt_oms_shop_candidates
+    ), fallback AS (
+      SELECT r.customer_code,r.customer_name,r.wdt_shop,r.name_score,r.vector_score,r.platform_score,r.total_score,
+        CASE WHEN r.total_score>=0.72 THEN '高置信' WHEN r.total_score>=0.55 THEN '待复核' ELSE '低置信' END mapping_status,
+        '现有名称/交易匹配兜底' mapping_source,
+        COALESCE(sm.shop_id,'') wdt_shop_id,COALESCE(sm.platform,'') wdt_platform,COALESCE(sm.auth_status,'') wdt_auth_status
+      FROM r LEFT JOIN wdt_shop_master sm ON sm.shop_name=r.wdt_shop
+      WHERE r.rn=1
+        AND NOT EXISTS (SELECT 1 FROM wdt_oms_shop_official o
+                        WHERE o.customer_code=r.customer_code OR o.wdt_shop=r.wdt_shop)
+    )
+    SELECT * FROM wdt_oms_shop_official
+    UNION ALL
+    SELECT * FROM fallback;
 
     DROP TABLE IF EXISTS wdt_oms_item_recon;
     CREATE TABLE wdt_oms_item_recon AS
@@ -386,15 +454,16 @@ def build_candidates(connection: sqlite3.Connection, output_dir: Path) -> Dict[s
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, default=ROOT.parent / "input")
-    parser.add_argument("--database", type=Path, default=ROOT / "work_full" / "reconciliation.db")
-    parser.add_argument("--work", type=Path, default=ROOT / "work_full")
-    parser.add_argument("--output", type=Path, default=ROOT / "output_flow_exploration")
+    parser.add_argument("--database", type=Path, default=ROOT / "work" / "reconciliation.db")
+    parser.add_argument("--work", type=Path, default=ROOT / "work")
+    parser.add_argument("--output", type=Path, default=ROOT / "intermediate" / "exploration")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-rows-per-file", type=int)
     parser.add_argument("--reuse-wdt", action="store_true")
     args = parser.parse_args()
     connection = sqlite3.connect(args.database)
     BASE.configure_database(connection)
+    load_wdt_shop_master(connection, args.input)
     if not args.reuse_wdt:
         load_wdt(connection, args.input, args.work, args.workers, args.max_rows_per_file)
     result = build_candidates(connection, args.output)
