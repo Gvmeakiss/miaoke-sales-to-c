@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """2026年1-6月销售ToC流程核对：订单→账单→OMS月结→SAP。
 
-核对原则：业务流程顺序展示，各环节单独执行pairwise核对。
-订单—账单环节以2026年1-6月惠策导出账单为基表，向前追溯
-2025年12月1日至2026年6月30日的旺店通订单。
+核对原则：业务流程顺序展示，各环节单独执行pairwise核对；金额主口径统一为惠策实际实收、惠策实际结算、OMS结算及SAP标准发票含税金额。
+订单—账单环节以2026年1-6月惠策导出账单为基表，正式匹配仅使用
+2026年1月1日至2026年6月30日的旺店通订单。2025年11月及12月订单
+仅由独立Cut-off敏感性分析脚本使用，不进入正式候选池。
 惠策不含商品数量，因此数量链使用“惠策已出现订单对应的旺店通商品数量”。
 """
 
@@ -20,7 +21,7 @@ DB = ROOT / "work" / "reconciliation.db"
 OUT = ROOT / "results"
 REPORT_START = "2026-01-01"
 REPORT_END_EXCLUSIVE = "2026-07-01"
-ORDER_LOOKBACK_START = "2025-12-01"
+ORDER_LOOKBACK_START = "2026-01-01"
 ORDER_LOOKBACK_END_EXCLUSIVE = REPORT_END_EXCLUSIVE
 
 
@@ -130,9 +131,7 @@ def build(conn: sqlite3.Connection) -> None:
       COALESCE(w.wdt_amount,0)-h.bill_receivable receivable_difference,
       COALESCE(w.wdt_amount,0)-h.bill_cash cash_difference,COALESCE(w.internal_orders,'') internal_orders,h.reconcile_ids,
       CASE WHEN w.platform_order_no IS NULL THEN '仅账单'
-           WHEN ABS(w.wdt_amount-h.bill_receivable)<=0.01 THEN '单号分摊应收一致'
            WHEN ABS(w.wdt_amount-h.bill_cash)<=0.01 THEN '单号分摊实收一致'
-           WHEN ABS(w.wdt_header_amount-h.bill_receivable)<=0.01 THEN '单号订单应收一致'
            WHEN ABS(w.wdt_header_amount-h.bill_cash)<=0.01 THEN '单号订单实收一致'
            ELSE '单号一致金额差异' END result
     FROM v4_huice_platform h LEFT JOIN v4_wdt_platform w ON w.platform_order_no=h.platform_order_no
@@ -192,9 +191,8 @@ def build(conn: sqlite3.Connection) -> None:
       COALESCE(s.bill_cash,0)-d.detail_cash cash_difference,
       d.historical_rows,d.historical_receivable,d.historical_cash,
       CASE WHEN s.huice_shop IS NULL THEN '仅惠策明细'
-           WHEN ABS(s.bill_receivable-d.detail_receivable)<=0.01
-            AND ABS(s.bill_cash-d.detail_cash)<=0.01 THEN '应收实收一致'
-           ELSE '应收实收差异' END result
+           WHEN ABS(s.bill_cash-d.detail_cash)<=0.01 THEN '实收一致'
+           ELSE '实收差异' END result
     FROM v4_huice_detail_settlement d LEFT JOIN v4_huice_shop_bill s
       ON s.bill_month=d.bill_month AND s.platform=d.platform AND s.huice_shop=d.huice_shop
     UNION ALL
@@ -297,11 +295,9 @@ def build(conn: sqlite3.Connection) -> None:
       COALESCE(s.sap_amount,0)-h.bill_success_amount sap_success_difference,
       CASE WHEN h.customer_code IS NULL OR h.customer_code='' THEN '店铺未映射'
            WHEN o.customer_code IS NULL THEN '仅账单'
-           WHEN ABS(o.oms_amount-h.bill_success_amount)<=0.01 THEN '成功金额一致'
-           WHEN ABS(o.oms_amount-h.bill_receivable)<=0.01 THEN '应收金额一致'
-           WHEN ABS(o.oms_amount-h.bill_cash)<=0.01 THEN '实收金额一致'
-           WHEN ABS(COALESCE(s.sap_amount,0)-h.bill_success_amount)<=0.01 THEN 'SAP辅助金额一致'
-           ELSE '金额差异' END result
+           WHEN ABS(o.oms_amount-h.bill_cash)<=0.01 THEN '实际结算金额一致'
+           WHEN ABS(COALESCE(s.sap_amount,0)-h.bill_cash)<=0.01 THEN 'SAP辅助实际结算金额一致'
+           ELSE '实际结算金额差异' END result
     FROM v4_huice_shop_map h LEFT JOIN v4_oms_month_shop o
       ON o.outbound_month=h.bill_month AND o.customer_code=h.customer_code
     LEFT JOIN v4_oms_month_shop_sap s
@@ -321,10 +317,10 @@ def build(conn: sqlite3.Connection) -> None:
     SELECT customer_code,MIN(customer_name) customer_name,
       SUM(bill_success_amount) bill_success_amount,SUM(bill_receivable) bill_receivable,
       SUM(bill_cash) bill_cash,SUM(oms_amount) oms_amount,
-      SUM(oms_amount)-SUM(bill_success_amount) period_difference,
-      SUM(ABS(success_difference)) monthly_gross_difference,
-      SUM(ABS(success_difference))-ABS(SUM(oms_amount)-SUM(bill_success_amount)) timing_offset,
-      CASE WHEN ABS(SUM(oms_amount)-SUM(bill_success_amount))<=0.01 THEN '期间累计一致'
+      SUM(oms_amount)-SUM(bill_cash) period_difference,
+      SUM(ABS(cash_difference)) monthly_gross_difference,
+      SUM(ABS(cash_difference))-ABS(SUM(oms_amount)-SUM(bill_cash)) timing_offset,
+      CASE WHEN ABS(SUM(oms_amount)-SUM(bill_cash))<=0.01 THEN '期间累计一致'
            ELSE '期间累计差异' END result
     FROM v4_bill_oms_month_recon WHERE COALESCE(customer_code,'')<>''
     GROUP BY customer_code;
@@ -411,7 +407,7 @@ def scalar(conn: sqlite3.Connection, query: str):
     return value or 0
 
 
-def export(conn: sqlite3.Connection) -> dict:
+def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
     OUT.mkdir(parents=True, exist_ok=True)
     queries = {
         "order_bill_recon": "SELECT * FROM v4_order_bill_recon ORDER BY CASE WHEN result LIKE '%一致' AND result<>'单号一致金额差异' THEN 3 ELSE 1 END,result,platform_order_no",
@@ -422,7 +418,7 @@ def export(conn: sqlite3.Connection) -> dict:
         "huice_shop_map": "SELECT * FROM v4_huice_shop_map ORDER BY mapping_status,bill_month,platform,huice_shop",
     }
     limits = {"order_bill_recon":18000,"huice_internal_recon":20000,"bill_oms_month_recon":20000,"order_bill_oms_qty_recon":20000,"oms_sap_field_map":20000,"huice_shop_map":20000}
-    for name, query in queries.items():
+    for name, query in queries.items() if write_details else []:
         cursor = conn.execute(query)
         headers = [column[0] for column in cursor.description]
         if name == "order_bill_recon":
@@ -477,6 +473,19 @@ def export(conn: sqlite3.Connection) -> dict:
         "bill_oms_period_customer": dict_rows(conn,"SELECT * FROM v4_bill_oms_period_customer ORDER BY ABS(period_difference) DESC"),
         "qty_customer_month": dict_rows(conn,"SELECT * FROM v4_qty_customer_month_recon ORDER BY cross_material_offset DESC"),
         "bill_oms_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(bill_record_count) bill_records,SUM(bill_success_amount) bill_success_amount,SUM(bill_receivable) bill_receivable,SUM(bill_cash) bill_cash,SUM(oms_qty) oms_qty,SUM(oms_amount) oms_amount,SUM(sap_assisted_qty) sap_assisted_qty,SUM(sap_assisted_amount) sap_assisted_amount FROM v4_bill_oms_month_recon GROUP BY result ORDER BY groups DESC"),
+        "huice_cutoff_daily": dict_rows(conn,"""
+          WITH dates(business_date) AS (VALUES ('2026-06-28'),('2026-06-29')),
+          daily AS (
+            SELECT h.business_date,COUNT(DISTINCT h.reconcile_id) bill_count,SUM(c.current_cash) bill_cash
+            FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
+            WHERE h.business_date IN ('2026-06-28','2026-06-29')
+              AND (h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
+                OR h.source_file LIKE '%4月%' OR h.source_file LIKE '%5月%' OR h.source_file LIKE '%6月%')
+            GROUP BY h.business_date
+          )
+          SELECT d.business_date,COALESCE(x.bill_count,0) bill_count,COALESCE(x.bill_cash,0) bill_cash
+          FROM dates d LEFT JOIN daily x ON x.business_date=d.business_date ORDER BY d.business_date
+        """),
         "qty_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(billed_orders) billed_orders,SUM(exact_evidence_orders) exact_evidence_orders,SUM(auxiliary_evidence_orders) auxiliary_evidence_orders,SUM(order_bill_qty) order_bill_qty,SUM(exact_order_bill_qty) exact_order_bill_qty,SUM(auxiliary_order_bill_qty) auxiliary_order_bill_qty,SUM(oms_qty) oms_qty,SUM(qty_difference) qty_difference FROM v4_order_bill_oms_qty_recon GROUP BY result ORDER BY groups DESC"),
         "oms_sap_results": dict_rows(conn,"SELECT mapping_result,COUNT(*) keys,SUM(sap_qty) sap_qty,SUM(oms_qty) oms_qty,SUM(sap_amount) sap_amount,SUM(oms_amount) oms_amount FROM v4_oms_sap_field_map GROUP BY mapping_result ORDER BY keys DESC"),
         "monthly_flow": dict_rows(conn,"""
@@ -579,9 +588,13 @@ def main() -> None:
     global OUT
     parser = argparse.ArgumentParser(description="生成销售ToC流程核对结果")
     parser.add_argument("--output-dir", type=Path, default=OUT, help="CSV/JSON输出目录")
+    parser.add_argument("--summary-only", action="store_true", help="复用现有核对表，仅刷新summary.json")
     args = parser.parse_args()
     OUT = args.output_dir.resolve()
-    conn=sqlite3.connect(DB);configure(conn);build(conn);summary=export(conn)
+    conn=sqlite3.connect(DB);configure(conn)
+    if not args.summary_only:
+        build(conn)
+    summary=export(conn, write_details=not args.summary_only)
     print(json.dumps(summary,ensure_ascii=False,indent=2))
 
 
