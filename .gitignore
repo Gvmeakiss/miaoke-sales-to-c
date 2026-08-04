@@ -48,5 +48,15 @@ OutPut/
 cache/
 input/
 .codex_tmp/
-reconciliation/work*/
-reconciliation/output*/
+node_modules/
+reconciliation/node_modules
+reconciliation/work/
+reconciliation/results/
+reconciliation/intermediate/
+reconciliation/qa_previews/
+
+# Dated process archives: keep each archive README, ignore bulky archived contents
+archive/*/过程检查/
+archive/*/中间结果/
+archive/*/弃用试验脚本/
+archive/*/系统缓存/
