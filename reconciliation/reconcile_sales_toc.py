@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import difflib
 import io
 import json
@@ -29,6 +30,25 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+from oms_transaction_codes import OMS_CODE_MAP, SOURCE_FILE as OMS_CODE_SOURCE
+
+HUICE_SUPPLEMENT_FILE = "历史账期对账结果明细6月-3.xlsx"
+
+
+def huice_detail_files(input_dir: Path) -> List[Path]:
+    """Return regular Huice exports first and the late-arriving supplement last.
+
+    Both downstream tables use INSERT OR IGNORE on 对账流水号, so this order
+    preserves the existing export when the same bill is present in both files.
+    """
+    files = sorted((input_dir / "惠策系统对账单清单").glob("*.xlsx"))
+    return sorted(files, key=lambda path: (path.name == HUICE_SUPPLEMENT_FILE, path.name))
+
+
+def stable_cache_name(path: Path) -> str:
+    digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:10]
+    return f"{path.stem}__{digest}.csv"
 
 from lxml import etree
 
@@ -234,7 +254,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
             quantity REAL,
             line_count INTEGER,
             schema_columns INTEGER,
-            PRIMARY KEY (source_file, order_no)
+            PRIMARY KEY (source_file, order_no, platform_order_no)
         );
 
         CREATE TABLE IF NOT EXISTS huice_detail (
@@ -257,7 +277,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS huice_summary (
-            monthly_id TEXT PRIMARY KEY,
+            monthly_id TEXT,
             reconcile_date TEXT,
             platform TEXT,
             shop TEXT,
@@ -270,7 +290,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             single_ar_amount REAL,
             single_cash_count REAL,
             single_cash_amount REAL,
-            source_file TEXT
+            source_file TEXT,
+            PRIMARY KEY (source_file, monthly_id)
         );
 
         CREATE TABLE IF NOT EXISTS sap2c (
@@ -321,6 +342,105 @@ def create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def refresh_oms_transaction_classification(connection: sqlite3.Connection) -> None:
+    """按事务码表建立日/月结分类；OMS原字段cycle_type不用于该判断。"""
+    connection.executescript(
+        """
+        DROP VIEW IF EXISTS oms_detail_classified;
+        DROP TABLE IF EXISTS oms_transaction_code_map;
+        CREATE TABLE oms_transaction_code_map (
+          business_type TEXT PRIMARY KEY,
+          settlement_cycle TEXT NOT NULL,
+          source_file TEXT NOT NULL
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO oms_transaction_code_map VALUES (?,?,?)",
+        [
+            (code, cycle, OMS_CODE_SOURCE.name)
+            for cycle, codes in OMS_CODE_MAP.items()
+            for code in codes
+        ],
+    )
+    connection.executescript(
+        """
+        CREATE VIEW oms_detail_classified AS
+        SELECT o.*,COALESCE(m.settlement_cycle,'未分类') settlement_cycle
+        FROM oms_detail o
+        LEFT JOIN oms_transaction_code_map m ON m.business_type=o.business_type;
+        """
+    )
+    connection.commit()
+
+
+def ensure_huice_summary_composite_key(connection: sqlite3.Connection) -> None:
+    """月汇总流水号仅在单个导出文件内唯一，旧单字段主键会覆盖跨文件记录。"""
+    info = connection.execute("PRAGMA table_info(huice_summary)").fetchall()
+    primary_key = [row[1] for row in sorted((row for row in info if row[5]), key=lambda row: row[5])]
+    expected = ["source_file", "monthly_id"]
+    if not info or primary_key == expected:
+        return
+    connection.executescript(
+        """
+        DROP TABLE IF EXISTS huice_summary;
+        CREATE TABLE huice_summary (
+            monthly_id TEXT,
+            reconcile_date TEXT,
+            platform TEXT,
+            shop TEXT,
+            success_count REAL,
+            success_amount REAL,
+            mismatch_count REAL,
+            mismatch_receivable REAL,
+            mismatch_cash REAL,
+            single_ar_count REAL,
+            single_ar_amount REAL,
+            single_cash_count REAL,
+            single_cash_amount REAL,
+            source_file TEXT,
+            PRIMARY KEY (source_file, monthly_id)
+        );
+        DELETE FROM stage_meta WHERE stage='huice_summary';
+        """
+    )
+    connection.commit()
+
+
+def ensure_wdt_order_composite_key(connection: sqlite3.Connection) -> None:
+    """旺店通内部订单编号会跨多个平台原始单号复用，必须保留平台单号粒度。"""
+    info = connection.execute("PRAGMA table_info(wdt_orders_file)").fetchall()
+    primary_key = [row[1] for row in sorted((row for row in info if row[5]), key=lambda row: row[5])]
+    expected = ["source_file", "order_no", "platform_order_no"]
+    if not info or primary_key == expected:
+        return
+    connection.executescript(
+        """
+        DROP TABLE IF EXISTS wdt_orders_file;
+        CREATE TABLE wdt_orders_file (
+            source_file TEXT,
+            order_no TEXT,
+            platform_order_no TEXT,
+            sub_order_no TEXT,
+            shop TEXT,
+            order_status TEXT,
+            order_type TEXT,
+            trade_time TEXT,
+            payment_time TEXT,
+            ship_time TEXT,
+            receivable_amount REAL,
+            allocated_total REAL,
+            quantity REAL,
+            line_count INTEGER,
+            schema_columns INTEGER,
+            PRIMARY KEY (source_file, order_no, platform_order_no)
+        );
+        DELETE FROM stage_meta WHERE stage='wdt';
+        """
+    )
+    connection.commit()
+
+
 def stage_complete(connection: sqlite3.Connection, stage: str) -> bool:
     return connection.execute("SELECT 1 FROM stage_meta WHERE stage=?", (stage,)).fetchone() is not None
 
@@ -340,7 +460,12 @@ def wdt_files(input_dir: Path) -> List[Path]:
 
 
 def extract_wdt_file_to_csv(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str, int]:
-    """并行工作进程：把一个旺店通分卷压缩到内部订单级CSV。"""
+    """并行工作进程：把一个旺店通分卷压缩到“内部订单+平台单号”级CSV。
+
+    一个旺店通内部订单可能包含多个平台原始单号（常见于批量/手工导入单）。
+    表头金额、商品数量及分摊金额必须保留到平台单号粒度，不能全部挂在首个
+    平台单号下。
+    """
     path_text, cache_text, max_rows = task
     path = Path(path_text)
     cache_path = Path(cache_text)
@@ -368,27 +493,28 @@ def extract_wdt_file_to_csv(task: Tuple[str, str, Optional[int]]) -> Tuple[str, 
     selected = sorted({column for column in fields.values() if column})
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     current_order = ""
-    aggregate: Optional[Dict[str, object]] = None
+    aggregates: Dict[Tuple[str, str], Dict[str, object]] = {}
     count = 0
     with cache_path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
 
         def emit() -> None:
-            nonlocal aggregate, count
-            if not aggregate:
+            nonlocal count
+            if not aggregates:
                 return
-            writer.writerow(
-                [
-                    path.name,
-                    aggregate["order_no"], aggregate["platform_order_no"], aggregate["sub_order_no"],
-                    aggregate["shop"], aggregate["order_status"], aggregate["order_type"],
-                    aggregate["trade_time"], aggregate["payment_time"], aggregate["ship_time"],
-                    aggregate["receivable_amount"], aggregate["allocated_total"], aggregate["quantity"],
-                    aggregate["line_count"], len(header),
-                ]
-            )
-            count += 1
-            aggregate = None
+            for aggregate in aggregates.values():
+                writer.writerow(
+                    [
+                        path.name,
+                        aggregate["order_no"], aggregate["platform_order_no"], aggregate["sub_order_no"],
+                        aggregate["shop"], aggregate["order_status"], aggregate["order_type"],
+                        aggregate["trade_time"], aggregate["payment_time"], aggregate["ship_time"],
+                        aggregate["receivable_amount"], aggregate["allocated_total"], aggregate["quantity"],
+                        aggregate["line_count"], len(header),
+                    ]
+                )
+                count += 1
+            aggregates.clear()
 
         def value(values: Dict[int, Optional[str]], key: str) -> str:
             column = fields[key]
@@ -401,9 +527,13 @@ def extract_wdt_file_to_csv(task: Tuple[str, str, Optional[int]]) -> Tuple[str, 
             if order_no != current_order:
                 emit()
                 current_order = order_no
+            platform_order_no = value(values, "platform_order_no")
+            key = (order_no, platform_order_no)
+            aggregate = aggregates.get(key)
+            if aggregate is None:
                 aggregate = {
                     "order_no": order_no,
-                    "platform_order_no": value(values, "platform_order_no"),
+                    "platform_order_no": platform_order_no,
                     "sub_order_no": value(values, "sub_order_no"),
                     "shop": value(values, "shop"),
                     "order_status": value(values, "order_status"),
@@ -416,7 +546,12 @@ def extract_wdt_file_to_csv(task: Tuple[str, str, Optional[int]]) -> Tuple[str, 
                     "quantity": 0.0,
                     "line_count": 0,
                 }
-            assert aggregate is not None
+                aggregates[key] = aggregate
+            else:
+                aggregate["receivable_amount"] = max(
+                    float(aggregate["receivable_amount"]),
+                    as_number(value(values, "receivable_amount")),
+                )
             aggregate["allocated_total"] = float(aggregate["allocated_total"]) + as_number(value(values, "allocated_total"))
             aggregate["quantity"] = float(aggregate["quantity"]) + as_number(value(values, "quantity"))
             aggregate["line_count"] = int(aggregate["line_count"]) + 1
@@ -437,9 +572,24 @@ def extract_wdt(
         return
     connection.execute("DELETE FROM wdt_orders_file")
     connection.commit()
-    insert_sql = "INSERT OR REPLACE INTO wdt_orders_file VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    insert_sql = """
+        INSERT INTO wdt_orders_file VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(source_file,order_no,platform_order_no) DO UPDATE SET
+          sub_order_no=MAX(wdt_orders_file.sub_order_no,excluded.sub_order_no),
+          shop=MAX(wdt_orders_file.shop,excluded.shop),
+          order_status=MAX(wdt_orders_file.order_status,excluded.order_status),
+          order_type=MAX(wdt_orders_file.order_type,excluded.order_type),
+          trade_time=MIN(wdt_orders_file.trade_time,excluded.trade_time),
+          payment_time=MIN(wdt_orders_file.payment_time,excluded.payment_time),
+          ship_time=MAX(wdt_orders_file.ship_time,excluded.ship_time),
+          receivable_amount=MAX(wdt_orders_file.receivable_amount,excluded.receivable_amount),
+          allocated_total=wdt_orders_file.allocated_total+excluded.allocated_total,
+          quantity=wdt_orders_file.quantity+excluded.quantity,
+          line_count=wdt_orders_file.line_count+excluded.line_count,
+          schema_columns=MAX(wdt_orders_file.schema_columns,excluded.schema_columns)
+    """
     files = wdt_files(input_dir)
-    cache_dir = work_dir / "wdt_order_cache"
+    cache_dir = work_dir / "wdt_order_platform_cache"
     tasks = [
         (str(path), str(cache_dir / f"{index:02d}_{path.stem}.csv"), max_rows)
         for index, path in enumerate(files, start=1)
@@ -531,9 +681,9 @@ def extract_huice_detail(
         INSERT OR IGNORE INTO huice_detail VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
-    files = sorted((input_dir / "惠策系统对账单清单").glob("*.xlsx"))
+    files = huice_detail_files(input_dir)
     cache_dir = work_dir / "huice_detail_cache"
-    tasks = [(str(path), str(cache_dir / f"{index:02d}_{path.stem}.csv"), max_rows) for index, path in enumerate(files, start=1)]
+    tasks = [(str(path), str(cache_dir / stable_cache_name(path)), max_rows) for path in files]
     results = []
     with ProcessPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(extract_huice_file_to_csv, task): task[0] for task in tasks}
@@ -542,7 +692,7 @@ def extract_huice_detail(
             results.append((name, cache_path, count))
             log(f"惠策明细并行抽取 {completed}/{len(tasks)}: {name}，记录{count:,}")
     total = 0
-    for name, cache_path, count in sorted(results):
+    for name, cache_path, count in sorted(results, key=lambda item: (item[0] == HUICE_SUPPLEMENT_FILE, item[0])):
         batch = []
         with Path(cache_path).open("r", encoding="utf-8", newline="") as stream:
             for row in csv.reader(stream):
@@ -797,7 +947,8 @@ def materialize_analysis_tables(connection: sqlite3.Connection) -> None:
           COUNT(*) AS file_occurrences,
           GROUP_CONCAT(source_file, '|') AS source_files
         FROM wdt_orders_file
-        GROUP BY order_no;
+        GROUP BY order_no, platform_order_no;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wdt_order_pair ON wdt_order_dedup(order_no,platform_order_no);
         CREATE INDEX IF NOT EXISTS idx_wdt_order_platform ON wdt_order_dedup(platform_order_no);
 
         DROP TABLE IF EXISTS wdt_platform;
@@ -1202,6 +1353,8 @@ def main() -> None:
     connection = sqlite3.connect(database_path)
     configure_database(connection)
     create_schema(connection)
+    ensure_wdt_order_composite_key(connection)
+    ensure_huice_summary_composite_key(connection)
     max_rows = args.max_rows_per_file or None
 
     extract_wdt(connection, args.input, args.work, max_rows, args.workers)
@@ -1209,6 +1362,7 @@ def main() -> None:
     extract_huice_summary(connection, args.input, max_rows)
     extract_sap2c(connection, args.input, max_rows)
     extract_oms(connection, args.input, max_rows)
+    refresh_oms_transaction_classification(connection)
     build_customer_mapping(connection)
     materialize_analysis_tables(connection)
     summary = build_summary(connection, args.output)
