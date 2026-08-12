@@ -23,6 +23,7 @@ SPEC = importlib.util.spec_from_file_location("recon_base", ROOT / "reconcile_sa
 BASE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
 SPEC.loader.exec_module(BASE)
+HUICE_SUPPLEMENT_FILE = BASE.HUICE_SUPPLEMENT_FILE
 
 
 def extract_order_items(task: Tuple[str, str, Optional[int]]) -> Tuple[str, str, int]:
@@ -158,16 +159,16 @@ def extract_huice_current_file(task: Tuple[str, str, Optional[int]]) -> Tuple[st
 
 def load_huice_current(conn: sqlite3.Connection, input_dir: Path, work_dir: Path, workers: int, max_rows: Optional[int]) -> None:
     conn.executescript("DROP TABLE IF EXISTS huice_current_amount; CREATE TABLE huice_current_amount(reconcile_id TEXT PRIMARY KEY,current_receivable REAL,current_cash REAL);")
-    files = sorted((input_dir / "惠策系统对账单清单").glob("*.xlsx"))
+    files = BASE.huice_detail_files(input_dir)
     cache_dir = work_dir / "huice_current_cache"
-    tasks = [(str(p), str(cache_dir / f"{i:02d}_{p.stem}.csv"), max_rows) for i, p in enumerate(files, 1)]
+    tasks = [(str(p), str(cache_dir / BASE.stable_cache_name(p)), max_rows) for p in files]
     results = []
     with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = [pool.submit(extract_huice_current_file, t) for t in tasks]
         for i, future in enumerate(as_completed(futures), 1):
             result = future.result(); results.append(result)
             print(f"惠策本期金额抽取 {i}/{len(tasks)} {result[0]}：{result[2]:,}行", flush=True)
-    for name, cache, _ in sorted(results):
+    for name, cache, _ in sorted(results, key=lambda item: (item[0] == HUICE_SUPPLEMENT_FILE, item[0])):
         batch = []
         with Path(cache).open("r", encoding="utf-8", newline="") as stream:
             for row in csv.reader(stream):
@@ -180,14 +181,18 @@ def load_huice_current(conn: sqlite3.Connection, input_dir: Path, work_dir: Path
 
 
 def build_reconciliation(conn: sqlite3.Connection) -> dict:
-    conn.executescript("""
+    conn.executescript(f"""
     DROP TABLE IF EXISTS huice_order_month;
     CREATE TABLE huice_order_month AS
-    SELECT substr(COALESCE(NULLIF(business_date,''),period_end),1,7) huice_month,
+    SELECT CASE WHEN h.source_file='{HUICE_SUPPLEMENT_FILE}' THEN '2026-06'
+                ELSE substr(COALESCE(NULLIF(business_date,''),period_end),1,7) END huice_month,
       platform,shop,platform_order_no,
       SUM(c.current_receivable) huice_receivable,SUM(c.current_cash) huice_cash,COUNT(*) huice_rows
     FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
-    WHERE platform_order_no<>'' AND substr(COALESCE(NULLIF(business_date,''),period_end),1,7) BETWEEN '2025-12' AND '2026-06'
+    WHERE platform_order_no<>'' AND (
+      h.source_file='{HUICE_SUPPLEMENT_FILE}' OR
+      substr(COALESCE(NULLIF(business_date,''),period_end),1,7) BETWEEN '2025-12' AND '2026-06'
+    )
     GROUP BY 1,2,3,4;
     CREATE INDEX idx_huice_order_month_order ON huice_order_month(platform_order_no);
 

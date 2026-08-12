@@ -2,8 +2,13 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
+: "${WORKSPACE_PYTHON:=python3}"
 : "${WORKSPACE_NODE:?请设置 WORKSPACE_NODE 为 Codex 工作区 Node.js 路径}"
 : "${WORKSPACE_NODE_MODULES:?请设置 WORKSPACE_NODE_MODULES 为 Codex 工作区 node_modules 路径}"
+
+if [[ "${SKIP_SETTLEMENT_REFRESH:-0}" != "1" ]]; then
+  "$WORKSPACE_PYTHON" "$project_root/reconciliation/refresh_settlement_oms_workpaper.py"
+fi
 
 task_tmp="$(mktemp -d)"
 cleanup() {

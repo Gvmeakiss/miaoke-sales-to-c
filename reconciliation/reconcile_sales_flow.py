@@ -3,7 +3,7 @@
 
 核对原则：业务流程顺序展示，各环节单独执行pairwise核对；金额主口径统一为惠策实际实收、惠策实际结算、OMS结算及SAP标准发票含税金额。
 订单—账单环节以2026年1-6月惠策导出账单为基表，正式匹配仅使用
-2026年1月1日至2026年6月30日的旺店通订单。2025年11月及12月订单
+2026年1月1日至2026年6月30日的旺店通订单。2025年12月订单
 仅由独立Cut-off敏感性分析脚本使用，不进入正式候选池。
 惠策不含商品数量，因此数量链使用“惠策已出现订单对应的旺店通商品数量”。
 """
@@ -16,6 +16,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from oms_transaction_codes import OMS_STANDARD_SETTLEMENT_CODES, sql_list
+
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "work" / "reconciliation.db"
 OUT = ROOT / "results"
@@ -23,6 +25,8 @@ REPORT_START = "2026-01-01"
 REPORT_END_EXCLUSIVE = "2026-07-01"
 ORDER_LOOKBACK_START = "2026-01-01"
 ORDER_LOOKBACK_END_EXCLUSIVE = REPORT_END_EXCLUSIVE
+HUICE_SUPPLEMENT_FILE = "历史账期对账结果明细6月-3.xlsx"
+OMS_STANDARD_SETTLEMENT_SQL = sql_list(OMS_STANDARD_SETTLEMENT_CODES)
 
 
 def configure(conn: sqlite3.Connection) -> None:
@@ -71,13 +75,14 @@ def build(conn: sqlite3.Connection) -> None:
     CREATE TABLE v4_huice_platform AS
     SELECT CASE WHEN h.platform_order_no='' THEN '__HC__'||h.reconcile_id ELSE h.platform_order_no END platform_order_no,
       MIN(h.platform) platform,MIN(h.shop) huice_shop,
-      MIN(CASE WHEN h.source_file LIKE '%1月%' THEN '2026-01' WHEN h.source_file LIKE '%2月%' THEN '2026-02'
+      MIN(CASE WHEN h.source_file='{HUICE_SUPPLEMENT_FILE}' THEN '2026-06'
+               WHEN h.source_file LIKE '%1月%' THEN '2026-01' WHEN h.source_file LIKE '%2月%' THEN '2026-02'
                WHEN h.source_file LIKE '%3月%' THEN '2026-03' WHEN h.source_file LIKE '%4月%' THEN '2026-04'
                WHEN h.source_file LIKE '%5月%' THEN '2026-05' WHEN h.source_file LIKE '%6月%' THEN '2026-06' END) bill_month,
       COUNT(*) huice_rows,SUM(c.current_receivable) bill_receivable,SUM(c.current_cash) bill_cash,
       GROUP_CONCAT(h.reconcile_id,'|') reconcile_ids
     FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
-    WHERE h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
+    WHERE h.source_file='{HUICE_SUPPLEMENT_FILE}' OR h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
        OR h.source_file LIKE '%4月%' OR h.source_file LIKE '%5月%' OR h.source_file LIKE '%6月%'
     GROUP BY CASE WHEN h.platform_order_no='' THEN '__HC__'||h.reconcile_id ELSE h.platform_order_no END;
     CREATE UNIQUE INDEX idx_v4_huice_platform ON v4_huice_platform(platform_order_no);
@@ -148,35 +153,52 @@ def build(conn: sqlite3.Connection) -> None:
 
     DROP TABLE IF EXISTS v4_huice_shop_bill;
     CREATE TABLE v4_huice_shop_bill AS
-    SELECT CASE WHEN source_file LIKE '%1月%' THEN '2026-01' WHEN source_file LIKE '%2月%' THEN '2026-02'
-                WHEN source_file LIKE '%3月%' THEN '2026-03' WHEN source_file LIKE '%4月%' THEN '2026-04'
-                WHEN source_file LIKE '%5月%' THEN '2026-05' WHEN source_file LIKE '%6月%' THEN '2026-06' END bill_month,
-      platform,shop huice_shop,
-      SUM(success_count+mismatch_count+single_ar_count+single_cash_count) bill_record_count,
-      SUM(success_count) success_count,SUM(success_amount) bill_success_amount,
-      SUM(success_amount+mismatch_receivable+single_ar_amount) bill_receivable,
-      SUM(success_amount+mismatch_cash+single_cash_amount) bill_cash,
-      COUNT(*) source_rows
-    FROM huice_summary
-    WHERE source_file LIKE '%1月%' OR source_file LIKE '%2月%' OR source_file LIKE '%3月%'
-       OR source_file LIKE '%4月%' OR source_file LIKE '%5月%' OR source_file LIKE '%6月%'
-    GROUP BY 1,2,3;
+    WITH base_summary AS (
+      SELECT CASE WHEN source_file LIKE '%1月%' THEN '2026-01' WHEN source_file LIKE '%2月%' THEN '2026-02'
+                  WHEN source_file LIKE '%3月%' THEN '2026-03' WHEN source_file LIKE '%4月%' THEN '2026-04'
+                  WHEN source_file LIKE '%5月%' THEN '2026-05' WHEN source_file LIKE '%6月%' THEN '2026-06' END bill_month,
+        platform,shop huice_shop,
+        SUM(success_count+mismatch_count+single_ar_count+single_cash_count) bill_record_count,
+        SUM(success_count) success_count,SUM(success_amount) bill_success_amount,
+        SUM(success_amount+mismatch_receivable+single_ar_amount) bill_receivable,
+        SUM(success_amount+mismatch_cash+single_cash_amount) bill_cash,
+        COUNT(*) source_rows
+      FROM huice_summary
+      WHERE source_file LIKE '%1月%' OR source_file LIKE '%2月%' OR source_file LIKE '%3月%'
+         OR source_file LIKE '%4月%' OR source_file LIKE '%5月%' OR source_file LIKE '%6月%'
+      GROUP BY 1,2,3
+    ), supplement_summary AS (
+      SELECT '2026-06' bill_month,h.platform,h.shop huice_shop,
+        COUNT(*) bill_record_count,COUNT(*) success_count,
+        SUM(c.current_cash) bill_success_amount,SUM(c.current_receivable) bill_receivable,
+        SUM(c.current_cash) bill_cash,COUNT(*) source_rows
+      FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
+      WHERE h.source_file='{HUICE_SUPPLEMENT_FILE}'
+      GROUP BY h.platform,h.shop
+    )
+    SELECT bill_month,platform,huice_shop,
+      SUM(bill_record_count) bill_record_count,SUM(success_count) success_count,
+      SUM(bill_success_amount) bill_success_amount,SUM(bill_receivable) bill_receivable,
+      SUM(bill_cash) bill_cash,SUM(source_rows) source_rows
+    FROM (SELECT * FROM base_summary UNION ALL SELECT * FROM supplement_summary)
+    GROUP BY bill_month,platform,huice_shop;
 
     -- 惠策明细与店铺汇总必须使用相同的“导出结算月份”口径核对。
     -- 业务日期可落在往期，若按业务日期过滤会把汇总中合法的往期回款排除。
     DROP TABLE IF EXISTS v4_huice_detail_settlement;
     CREATE TABLE v4_huice_detail_settlement AS
-    SELECT CASE WHEN h.source_file LIKE '%1月%' THEN '2026-01' WHEN h.source_file LIKE '%2月%' THEN '2026-02'
+    SELECT CASE WHEN h.source_file='{HUICE_SUPPLEMENT_FILE}' THEN '2026-06'
+                WHEN h.source_file LIKE '%1月%' THEN '2026-01' WHEN h.source_file LIKE '%2月%' THEN '2026-02'
                 WHEN h.source_file LIKE '%3月%' THEN '2026-03' WHEN h.source_file LIKE '%4月%' THEN '2026-04'
                 WHEN h.source_file LIKE '%5月%' THEN '2026-05' WHEN h.source_file LIKE '%6月%' THEN '2026-06' END bill_month,
       h.platform,h.shop huice_shop,COUNT(*) detail_rows,
       SUM(CASE WHEN h.reconcile_status='对账成功' THEN c.current_receivable ELSE 0 END) detail_success_amount,
       SUM(c.current_receivable) detail_receivable,SUM(c.current_cash) detail_cash,
-      SUM(CASE WHEN COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN 1 ELSE 0 END) historical_rows,
-      SUM(CASE WHEN COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN c.current_receivable ELSE 0 END) historical_receivable,
-      SUM(CASE WHEN COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN c.current_cash ELSE 0 END) historical_cash
+      SUM(CASE WHEN h.source_file<>'{HUICE_SUPPLEMENT_FILE}' AND COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN 1 ELSE 0 END) historical_rows,
+      SUM(CASE WHEN h.source_file<>'{HUICE_SUPPLEMENT_FILE}' AND COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN c.current_receivable ELSE 0 END) historical_receivable,
+      SUM(CASE WHEN h.source_file<>'{HUICE_SUPPLEMENT_FILE}' AND COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN c.current_cash ELSE 0 END) historical_cash
     FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
-    WHERE h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
+    WHERE h.source_file='{HUICE_SUPPLEMENT_FILE}' OR h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
        OR h.source_file LIKE '%4月%' OR h.source_file LIKE '%5月%' OR h.source_file LIKE '%6月%'
     GROUP BY 1,2,3;
 
@@ -237,7 +259,7 @@ def build(conn: sqlite3.Connection) -> None:
     SELECT outbound_month,customer_code,MIN(customer_name) customer_name,
       COUNT(DISTINCT document_no) oms_docs,SUM(item_num) oms_qty,SUM(share_amount) oms_amount,COUNT(*) oms_lines
     FROM oms_detail
-    WHERE business_type='Y001' AND outbound_time>='{REPORT_START}' AND outbound_time<'{REPORT_END_EXCLUSIVE}'
+    WHERE business_type IN ({OMS_STANDARD_SETTLEMENT_SQL}) AND outbound_time>='{REPORT_START}' AND outbound_time<'{REPORT_END_EXCLUSIVE}'
     GROUP BY 1,2;
 
     DROP TABLE IF EXISTS v4_oms_sap_field_map;
@@ -247,7 +269,7 @@ def build(conn: sqlite3.Connection) -> None:
         MIN(customer_name) customer_name,SUM(item_num) oms_source_qty,SUM(share_amount) oms_source_amount,
         COUNT(*) oms_source_rows
       FROM oms_detail
-      WHERE business_type='Y001' AND outbound_time>='{REPORT_START}' AND outbound_time<'{REPORT_END_EXCLUSIVE}'
+      WHERE business_type IN ({OMS_STANDARD_SETTLEMENT_SQL}) AND outbound_time>='{REPORT_START}' AND outbound_time<'{REPORT_END_EXCLUSIVE}'
       GROUP BY 1,2,3
     )
     SELECT r.oms_sales_no,r.material_code,r.sales_unit,r.file_month,od.outbound_month,r.sap_invoice_nos,
@@ -356,7 +378,7 @@ def build(conn: sqlite3.Connection) -> None:
     ), o AS (
       SELECT outbound_month,customer_code,MIN(customer_name) customer_name,item_code,
         SUM(item_num) oms_qty,SUM(share_amount) oms_amount,COUNT(DISTINCT document_no) oms_docs
-      FROM oms_detail WHERE business_type='Y001' AND outbound_time>='{REPORT_START}' AND outbound_time<'{REPORT_END_EXCLUSIVE}'
+      FROM oms_detail WHERE business_type IN ({OMS_STANDARD_SETTLEMENT_SQL}) AND outbound_time>='{REPORT_START}' AND outbound_time<'{REPORT_END_EXCLUSIVE}'
       GROUP BY 1,2,4
     )
     SELECT w.ship_month,w.wdt_shop,w.customer_code,w.customer_name,w.mapping_status,w.material_code,
@@ -473,19 +495,6 @@ def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
         "bill_oms_period_customer": dict_rows(conn,"SELECT * FROM v4_bill_oms_period_customer ORDER BY ABS(period_difference) DESC"),
         "qty_customer_month": dict_rows(conn,"SELECT * FROM v4_qty_customer_month_recon ORDER BY cross_material_offset DESC"),
         "bill_oms_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(bill_record_count) bill_records,SUM(bill_success_amount) bill_success_amount,SUM(bill_receivable) bill_receivable,SUM(bill_cash) bill_cash,SUM(oms_qty) oms_qty,SUM(oms_amount) oms_amount,SUM(sap_assisted_qty) sap_assisted_qty,SUM(sap_assisted_amount) sap_assisted_amount FROM v4_bill_oms_month_recon GROUP BY result ORDER BY groups DESC"),
-        "huice_cutoff_daily": dict_rows(conn,"""
-          WITH dates(business_date) AS (VALUES ('2026-06-28'),('2026-06-29')),
-          daily AS (
-            SELECT h.business_date,COUNT(DISTINCT h.reconcile_id) bill_count,SUM(c.current_cash) bill_cash
-            FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
-            WHERE h.business_date IN ('2026-06-28','2026-06-29')
-              AND (h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
-                OR h.source_file LIKE '%4月%' OR h.source_file LIKE '%5月%' OR h.source_file LIKE '%6月%')
-            GROUP BY h.business_date
-          )
-          SELECT d.business_date,COALESCE(x.bill_count,0) bill_count,COALESCE(x.bill_cash,0) bill_cash
-          FROM dates d LEFT JOIN daily x ON x.business_date=d.business_date ORDER BY d.business_date
-        """),
         "qty_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(billed_orders) billed_orders,SUM(exact_evidence_orders) exact_evidence_orders,SUM(auxiliary_evidence_orders) auxiliary_evidence_orders,SUM(order_bill_qty) order_bill_qty,SUM(exact_order_bill_qty) exact_order_bill_qty,SUM(auxiliary_order_bill_qty) auxiliary_order_bill_qty,SUM(oms_qty) oms_qty,SUM(qty_difference) qty_difference FROM v4_order_bill_oms_qty_recon GROUP BY result ORDER BY groups DESC"),
         "oms_sap_results": dict_rows(conn,"SELECT mapping_result,COUNT(*) keys,SUM(sap_qty) sap_qty,SUM(oms_qty) oms_qty,SUM(sap_amount) sap_amount,SUM(oms_amount) oms_amount FROM v4_oms_sap_field_map GROUP BY mapping_result ORDER BY keys DESC"),
         "monthly_flow": dict_rows(conn,"""

@@ -185,21 +185,28 @@ def main() -> None:
             "wdt_amount": round(float(check_wdt or 0), 2),
         }
         print(json.dumps({"category": label, **controls[label]}, ensure_ascii=False), flush=True)
+    total_huice_orders, total_huice_amount = conn.execute(
+        "SELECT COUNT(*),COALESCE(SUM(bill_cash),0) FROM v4_huice_platform"
+    ).fetchone()
+    total_wdt_orders, total_wdt_amount = conn.execute(
+        "SELECT COUNT(*),COALESCE(SUM(wdt_amount),0) FROM v4_wdt_platform"
+    ).fetchone()
+    successful = controls["可匹配条目"]
     summary = {
         "scope": "2026-01-01至2026-06-30",
         "matching_rule": "惠策平台订单号=旺店通原始单号；可匹配条目进一步要求金额差异不超过0.01元",
         "categories": controls,
         "control_totals": {
-            "huice_orders": 5769505,
-            "huice_amount": 275333617.04,
-            "wdt_orders": 4728414,
-            "wdt_amount": 268424590.67,
-            "successful_orders": 4204532,
-            "successful_huice_amount": 243122621.11,
-            "successful_wdt_amount": 243122622.15,
+            "huice_orders": int(total_huice_orders or 0),
+            "huice_amount": round(float(total_huice_amount or 0), 2),
+            "wdt_orders": int(total_wdt_orders or 0),
+            "wdt_amount": round(float(total_wdt_amount or 0), 2),
+            "successful_orders": int(successful["rows"]),
+            "successful_huice_amount": successful["huice_amount"],
+            "successful_wdt_amount": successful["wdt_amount"],
         },
         "notes": [
-            "2025年11月及12月Cut-off扩展数据未纳入本明细。",
+            "2025年12月Cut-off扩展数据未纳入本明细。",
             "惠策账单清单无商品编码及商品名称；商品编码取自旺店通商品明细，商品名称由OMS物料名称按商品编码辅助映射。",
             "“仅账单未匹配”区域包含订单号已命中但金额一致性未通过的记录，并单独标注为金额差异。",
         ],

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import difflib
 import io
 import json
@@ -29,6 +30,25 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+from oms_transaction_codes import OMS_CODE_MAP, SOURCE_FILE as OMS_CODE_SOURCE
+
+HUICE_SUPPLEMENT_FILE = "历史账期对账结果明细6月-3.xlsx"
+
+
+def huice_detail_files(input_dir: Path) -> List[Path]:
+    """Return regular Huice exports first and the late-arriving supplement last.
+
+    Both downstream tables use INSERT OR IGNORE on 对账流水号, so this order
+    preserves the existing export when the same bill is present in both files.
+    """
+    files = sorted((input_dir / "惠策系统对账单清单").glob("*.xlsx"))
+    return sorted(files, key=lambda path: (path.name == HUICE_SUPPLEMENT_FILE, path.name))
+
+
+def stable_cache_name(path: Path) -> str:
+    digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:10]
+    return f"{path.stem}__{digest}.csv"
 
 from lxml import etree
 
@@ -320,6 +340,38 @@ def create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+
+
+def refresh_oms_transaction_classification(connection: sqlite3.Connection) -> None:
+    """按事务码表建立日/月结分类；OMS原字段cycle_type不用于该判断。"""
+    connection.executescript(
+        """
+        DROP VIEW IF EXISTS oms_detail_classified;
+        DROP TABLE IF EXISTS oms_transaction_code_map;
+        CREATE TABLE oms_transaction_code_map (
+          business_type TEXT PRIMARY KEY,
+          settlement_cycle TEXT NOT NULL,
+          source_file TEXT NOT NULL
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO oms_transaction_code_map VALUES (?,?,?)",
+        [
+            (code, cycle, OMS_CODE_SOURCE.name)
+            for cycle, codes in OMS_CODE_MAP.items()
+            for code in codes
+        ],
+    )
+    connection.executescript(
+        """
+        CREATE VIEW oms_detail_classified AS
+        SELECT o.*,COALESCE(m.settlement_cycle,'未分类') settlement_cycle
+        FROM oms_detail o
+        LEFT JOIN oms_transaction_code_map m ON m.business_type=o.business_type;
+        """
+    )
+    connection.commit()
 
 
 def ensure_huice_summary_composite_key(connection: sqlite3.Connection) -> None:
@@ -629,9 +681,9 @@ def extract_huice_detail(
         INSERT OR IGNORE INTO huice_detail VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
-    files = sorted((input_dir / "惠策系统对账单清单").glob("*.xlsx"))
+    files = huice_detail_files(input_dir)
     cache_dir = work_dir / "huice_detail_cache"
-    tasks = [(str(path), str(cache_dir / f"{index:02d}_{path.stem}.csv"), max_rows) for index, path in enumerate(files, start=1)]
+    tasks = [(str(path), str(cache_dir / stable_cache_name(path)), max_rows) for path in files]
     results = []
     with ProcessPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(extract_huice_file_to_csv, task): task[0] for task in tasks}
@@ -640,7 +692,7 @@ def extract_huice_detail(
             results.append((name, cache_path, count))
             log(f"惠策明细并行抽取 {completed}/{len(tasks)}: {name}，记录{count:,}")
     total = 0
-    for name, cache_path, count in sorted(results):
+    for name, cache_path, count in sorted(results, key=lambda item: (item[0] == HUICE_SUPPLEMENT_FILE, item[0])):
         batch = []
         with Path(cache_path).open("r", encoding="utf-8", newline="") as stream:
             for row in csv.reader(stream):
@@ -1310,6 +1362,7 @@ def main() -> None:
     extract_huice_summary(connection, args.input, max_rows)
     extract_sap2c(connection, args.input, max_rows)
     extract_oms(connection, args.input, max_rows)
+    refresh_oms_transaction_classification(connection)
     build_customer_mapping(connection)
     materialize_analysis_tables(connection)
     summary = build_summary(connection, args.output)

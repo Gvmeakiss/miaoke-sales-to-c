@@ -16,9 +16,9 @@ OUTPUT = ROOT / "outputs" / "sales_toc_workpaper_final_20260101_20260630" / "202
 ROWS_PER_FILE = 1_000_000
 
 CATEGORIES = [
-    ("可匹配条目", SOURCE / "01_可匹配条目.csv", 4_204_532, Decimal("243122621.11"), Decimal("243122622.15")),
-    ("仅账单未匹配", SOURCE / "02_仅账单及账单未成功匹配.csv", 1_564_973, Decimal("32210995.93"), Decimal("23114287.69")),
-    ("仅订单未匹配", SOURCE / "03_仅订单未匹配.csv", 127_158, Decimal("0.00"), Decimal("2367485.25")),
+    ("可匹配条目", SOURCE / "01_可匹配条目.csv"),
+    ("仅账单未匹配", SOURCE / "02_仅账单及账单未成功匹配.csv"),
+    ("仅订单未匹配", SOURCE / "03_仅订单未匹配.csv"),
 ]
 
 
@@ -30,9 +30,13 @@ def checksum(path: Path) -> str:
     return digest.hexdigest()
 
 
-def split_category(label: str, source: Path, expected_rows: int, expected_huice: Decimal, expected_wdt: Decimal) -> dict:
+def split_category(label: str, source: Path, expected: dict) -> dict:
     category_dir = OUTPUT / label
     category_dir.mkdir(parents=True, exist_ok=True)
+    # Remove only generated category CSVs so a changed final part name cannot
+    # leave a stale prior-run file in the delivery directory.
+    for stale in category_dir.glob(f"{label}_第*.csv"):
+        stale.unlink()
     files = []
     total_rows = 0
     total_huice = Decimal("0")
@@ -91,9 +95,9 @@ def split_category(label: str, source: Path, expected_rows: int, expected_huice:
         close_part()
 
     verification = {
-        "rows_match": total_rows == expected_rows,
-        "huice_amount_match": total_huice.quantize(Decimal("0.01")) == expected_huice,
-        "wdt_amount_match": total_wdt.quantize(Decimal("0.01")) == expected_wdt,
+        "rows_match": total_rows == int(expected["rows"]),
+        "huice_amount_match": total_huice.quantize(Decimal("0.01")) == Decimal(str(expected["huice_amount"])),
+        "wdt_amount_match": total_wdt.quantize(Decimal("0.01")) == Decimal(str(expected["wdt_amount"])),
         "all_files_within_limit": all(item["rows"] <= ROWS_PER_FILE for item in files),
     }
     if not all(verification.values()):
@@ -110,21 +114,23 @@ def split_category(label: str, source: Path, expected_rows: int, expected_huice:
 
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    categories = [split_category(*item) for item in CATEGORIES]
+    controls = json.loads((SOURCE / "正式范围明细控制数.json").read_text(encoding="utf-8"))
+    categories = [split_category(label, source, controls["categories"][label]) for label, source in CATEGORIES]
+    totals = controls["control_totals"]
     manifest = {
         "scope": "2026-01-01至2026-06-30",
         "rows_per_file": ROWS_PER_FILE,
         "categories": categories,
         "totals": {
             "union_rows": sum(item["rows"] for item in categories),
-            "huice_orders": 5_769_505,
-            "wdt_orders": 4_728_414,
-            "successful_orders": 4_204_532,
-            "successful_huice_amount": 243_122_621.11,
-            "successful_wdt_amount": 243_122_622.15,
+            "huice_orders": totals["huice_orders"],
+            "wdt_orders": totals["wdt_orders"],
+            "successful_orders": totals["successful_orders"],
+            "successful_huice_amount": totals["successful_huice_amount"],
+            "successful_wdt_amount": totals["successful_wdt_amount"],
         },
         "verification": {
-            "union_rows_match": sum(item["rows"] for item in categories) == 5_896_663,
+            "union_rows_match": sum(item["rows"] for item in categories) == sum(int(item["rows"]) for item in controls["categories"].values()),
             "all_category_checks_pass": all(all(item["verification"].values()) for item in categories),
         },
     }
