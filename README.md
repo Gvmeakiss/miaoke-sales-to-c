@@ -1,4 +1,37 @@
-# 销售 ToC 数据核对项目
+# 销售 ToC 数据核对
+
+> 核对销售 ToC 业务链中订单、平台账单、发运/月结与财务开票数据，输出内部核对底稿。
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white" alt="Node">
+  <img src="https://img.shields.io/badge/Reconciliation-ToC-0E8A16" alt="ToC">
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
+  <img src="https://img.shields.io/github/last-commit/Gvmeakiss/miaoke-sales-to-c?label=updated" alt="Updated">
+</p>
+
+## 📋 目录
+
+- [1. 项目目的与当前状态](#1-项目目的与当前状态)
+- [2. 全局核对范围](#2-全局核对范围)
+- [3. 输入资料](#3-输入资料)
+- [4. 核对逻辑](#4-核对逻辑)
+  - [4.1 旺店通订单 → 惠策明细](#41-旺店通订单--惠策明细)
+  - [4.2 惠策店铺账单 → OMS 月结](#42-惠策店铺账单--oms-月结)
+  - [4.3 订单—账单证据 → OMS 月结数量](#43-订单账单证据--oms-月结数量)
+  - [4.4 OMS 月结 → SAP 发票](#44-oms-月结--sap-发票)
+- [5. 当前主要结果](#5-当前主要结果)
+  - [5.1 订单与账单](#51-订单与账单)
+  - [5.2 惠策店铺账单与 OMS 月结](#52-惠策店铺账单与-oms-月结)
+  - [5.3 数量核对](#53-数量核对)
+  - [5.4 OMS 与 SAP](#54-oms-与-sap)
+- [6. 输出文件](#6-输出文件)
+  - [6.1 主底稿](#61-主底稿)
+  - [6.2 完整结果](#62-完整结果)
+  - [6.3 代码](#63-代码)
+- [7. 重跑方法](#7-重跑方法)
+- [8. 后续跟进清单](#8-后续跟进清单)
+- [9. 重要限制](#9-重要限制)
 
 ## 1. 项目目的与当前状态
 
@@ -189,3 +222,13 @@ Excel 构建脚本还会扫描 `#REF!`、`#DIV/0!`、`#VALUE!`、`#NAME?` 和 `#
 - 惠策的成功金额、应收金额和实收金额含义不同，不能相互替代；成功金额为本项目对 OMS 的主比较口径。
 - 多对一汇总可提高可核对范围，但可能抵销单笔差异，因此完整异常明细仍需保留。
 - 本项目结果用于财务核对和异常定位，不自动构成会计调整、收入确认或审计结论。
+
+---
+
+<div align="center">
+
+**James Li · 审计数据分析工具集**
+
+📫 本工具用于内部审计与数据核对，辅助分析但不替代专业判断，不作为对外签字版本。
+
+</div>
