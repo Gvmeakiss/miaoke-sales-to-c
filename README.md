@@ -1,234 +1,132 @@
-# 销售 ToC 数据核对
+# 销售 ToC 数据核对（Miaoke） 🧮
 
-> 核对销售 ToC 业务链中订单、平台账单、发运/月结与财务开票数据，输出内部核对底稿。
+> 核对 Miaoke 销售 ToC 业务链中旺店通订单、惠策平台账单、OMS 月结与 SAP 开票数据，输出内部全链路核对底稿（Python 数据处理 + Node.js 底稿构建）。
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white" alt="Node">
-  <img src="https://img.shields.io/badge/Reconciliation-ToC-0E8A16" alt="ToC">
-  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/github/last-commit/Gvmeakiss/miaoke-sales-to-c?label=updated" alt="Updated">
-</p>
+[![Language](https://img.shields.io/badge/language-Python%20%7C%20Node.js-blue)](https://github.com/Gvmeakiss/miaoke-sales-to-c) [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/Gvmeakiss/miaoke-sales-to-c/blob/main/LICENSE) [![Domain](https://img.shields.io/badge/domain-Audit%20Analytics-orange)](https://github.com/Gvmeakiss/miaoke-sales-to-c)
 
-## 📋 目录
+## 📌 项目简介
 
-- [1. 项目目的与当前状态](#1-项目目的与当前状态)
-- [2. 全局核对范围](#2-全局核对范围)
-- [3. 输入资料](#3-输入资料)
-- [4. 核对逻辑](#4-核对逻辑)
-  - [4.1 旺店通订单 → 惠策明细](#41-旺店通订单--惠策明细)
-  - [4.2 惠策店铺账单 → OMS 月结](#42-惠策店铺账单--oms-月结)
-  - [4.3 订单—账单证据 → OMS 月结数量](#43-订单账单证据--oms-月结数量)
-  - [4.4 OMS 月结 → SAP 发票](#44-oms-月结--sap-发票)
-- [5. 当前主要结果](#5-当前主要结果)
-  - [5.1 订单与账单](#51-订单与账单)
-  - [5.2 惠策店铺账单与 OMS 月结](#52-惠策店铺账单与-oms-月结)
-  - [5.3 数量核对](#53-数量核对)
-  - [5.4 OMS 与 SAP](#54-oms-与-sap)
-- [6. 输出文件](#6-输出文件)
-  - [6.1 主底稿](#61-主底稿)
-  - [6.2 完整结果](#62-完整结果)
-  - [6.3 代码](#63-代码)
-- [7. 重跑方法](#7-重跑方法)
-- [8. 后续跟进清单](#8-后续跟进清单)
-- [9. 重要限制](#9-重要限制)
+本仓库用于核对 Miaoke 销售 ToC 业务链条的数据一致性：从旺店通订单，到惠策平台账单，到 OMS 月结（业务类型 `Y001`），再到 SAP 标准发票（2C）。业务流程按 `旺店通订单 → 惠策账单 → OMS 月结 Y001 → SAP 标准发票` 组织，但核对采用相邻系统单对单（pairwise）方式执行。技术栈为 **Python**（数据抽取、钩稽、SQLite 中间库、CSV/JSON 导出）加 **Node.js**（基于 `@oai/artifact-tool` 构建带格式的多 Sheet Excel 底稿）。全部为内部核对与审阅辅助，不自动下审计/会计结论。
 
-## 1. 项目目的与当前状态
+## ✨ 功能特性
 
-本项目用于核对销售 ToC 业务链条中的订单、平台账单、发运/月结和财务开票数据。
+- **四段 pairwise 核对**：
+  - 旺店通订单 → 惠策明细：主键 `旺店通原始单号 = 惠策平台订单号`，金额比较应收/实收；
+  - 惠策店铺账单 → OMS 月结：主维度 `月份 + 店铺/客户映射`，主口径惠策对账成功金额 vs OMS 月结金额；
+  - 订单—账单证据 → OMS 月结数量：`数量 A`（惠策出现的旺店通商品数量）vs `数量 B`（OMS 月结 Y001 原生数量）；
+  - OMS 月结 → SAP 发票：主键 `OMS销售单号 + 物料编码 + 销售单位`，比较数量与含税金额并双向补充字段。
+- **流式读取大 Excel**：`reconcile_sales_toc.py` 用 `lxml` 以 XML 流式读取 `.xlsx`，避免一次性载入内存；旺店通商品行先压缩到内部订单再汇总至平台原始单号。
+- **SQLite 中间库**：`reconcile_sales_flow_v4.py` / `reconcile_sales_toc.py` 将抽取结果写入 `work_full/reconciliation.db`，再导出分项明细 CSV 与 `summary.json`。
+- **惠策↔OMS 核对**：`reconcile_huice_oms.py` 的 `extract_order_items` / `load_order_items` / `extract_huice_current_file` / `load_huice_current` / `build_reconciliation` / `export_outputs` 完成订单项与惠策账单抽取与核对。
+- **店铺映射探索**：`explore_wdt_oms_matching.py` 的 `load_wdt` / `build_candidates` / `normalize_shop` / `platform` / `cosine` 用余弦相似度探索旺店通与 OMS 店铺映射。
+- **订单财务分析**：`订单数据分析_财务版.py` 的 `load_and_standardize` / `_periodize` / `_aggregate_finance` / `build_outputs` / `write_excel` 按期间与财务口径聚合订单数据。
+- **多版底稿构建（Node.js）**：`build_sales_flow_v4.mjs`（13 张表「业务流程核对底稿」）、`build_dataflow_workbook.mjs` / `build_dataflow_workbook_v3.mjs`（数据流核对底稿 V2/V3）、`build_reconciliation_workbook.mjs`（12 张表「全链路核对底稿」，读取 `summary.json` 与各 `*_workbook.json`）；均扫描 `#REF!`/`#DIV/0!`/`#VALUE!`/`#NAME?`/`#N/A` 并生成 `_qa_previews/`。
+- **明确阈值**：代码中金额一致阈值为绝对差异 `≤ 0.01` 元（`reconcile_sales_flow_v4.py` 多处 `ABS(...) <= 0.01`），数量一致阈值为差异 `≤ 0.000001`。
 
-当前已形成销售 ToC 业务流程核对底稿。业务流程按以下顺序组织，但核对采用相邻系统单对单方式执行：
+## 📂 目录结构
 
-```text
-旺店通订单 → 惠策账单 → OMS 月结 Y001 → SAP 标准发票（2C）
+```
+miaoke-sales-to-c/
+├── README.md
+├── requirements.txt              # pandas>=2.0 / numpy>=1.24 / openpyxl>=3.1 / lxml>=4.9
+├── 订单数据分析_财务版.py          # 订单财务口径聚合与 Excel 导出（load_and_standardize/_periodize/build_outputs）
+├── reconciliation/
+│   ├── reconcile_sales_toc.py    # ToC 全链路核对：流式读 xlsx → SQLite → CSV + summary.json
+│   ├── reconcile_huice_oms.py    # 惠策↔OMS 月结核对
+│   ├── explore_wdt_oms_matching.py # 旺店通↔OMS 店铺映射探索（余弦相似度）
+│   ├── reconcile_sales_flow_v4.py # 2026H1 主流程（订单→账单→OMS月结→SAP），写 work_full/reconciliation.db、output_flow_v4/
+│   ├── build_sales_flow_v4.mjs    # 生成 13 张表「业务流程核对底稿」Excel
+│   ├── build_dataflow_workbook.mjs / build_dataflow_workbook_v3.mjs # 数据流核对底稿 V2/V3
+│   └── build_reconciliation_workbook.mjs # 生成 12 张表「全链路核对底稿」Excel
+└── LICENSE
 ```
 
-当前底稿在不删除差异和不缩小分母的前提下，集中展示金额匹配和数量匹配：订单金额匹配率 93.64%、惠策成功金额/OMS月结金额匹配率 93.22%、OMS—SAP一致键金额覆盖匹配率 99.99%，共同范围净数量比 99.16%。底稿已修复金额差异记录被误标为匹配剔除的问题，并补入 28 个仅 OMS 键。现有资料已作为完整资料范围处理，后续跟进不以客户补充新资料为前提。
+## 🔧 环境要求
 
-底稿用于内部核对与审阅，不替代对准确匹配率和差异原因的判断，也不作为最终对外签字版本。
+- Python 3.8+（代码使用 `from __future__ import annotations`、`pathlib`、类型注解、`lxml` 流式解析）
+- Node.js 18+（Excel 构建脚本依赖 `@oai/artifact-tool`，普通 Node 环境可能需 Codex 工作区提供的依赖运行环境）
+- Python 依赖见 `requirements.txt`：`pandas>=2.0`、`numpy>=1.24`、`openpyxl>=3.1`、`lxml>=4.9`
 
-## 2. 全局核对范围
-
-- 核对期间：2026-01-01 至 2026-06-30，含首尾日期。
-- 旺店通：按发货时间纳入。
-- 惠策明细：按业务日期纳入；业务日期为空时使用账期结束日。
-- 惠策店铺汇总：按源文件所属月份纳入。
-- OMS：按出库时间纳入，仅使用业务类型 Y001 的月结数据。
-- SAP：按发票月份纳入，仅核对标准发票（2C）。
-- 金额一致阈值：绝对差异不超过 0.01 元。
-- 数量一致阈值：数量差异为 0；另外展示多对一归并后的总体比例。
-
-## 3. 输入资料
-
-输入资料统一保存在 `input/`：
-
-- `input/旺店通订单清单/`：订单表头及商品明细。
-- `input/惠策系统对账单清单/`：惠策订单级历史账期对账明细。
-- `input/惠策系统对账单汇总/`：惠策店铺级月度账单汇总。
-- `input/OMS 系统日结月结查询记录：25年12月到26年6月2C单据.sql`：OMS 日结及月结查询结果。
-- `input/发票清单：26.01.01-26.06.30/`：SAP 2026 年 1—6 月发票清单。
-- `input/OMS 系统日结月结查询记录：2025年全年.sql`：历史参考资料，不属于本期主核对范围。
-
-## 4. 核对逻辑
-
-### 4.1 旺店通订单 → 惠策明细
-
-- 主键：旺店通原始单号 = 惠策平台订单号。
-- 金额：旺店通订单金额分别与惠策本期应收、本期实收比较。
-- 数量：保留旺店通商品数量；惠策明细没有可用商品数量，因此该环节不直接比较双方数量。
-- 处理：应收或实收金额一致的订单作为已匹配组剔除，其余进入差异池。
-
-### 4.2 惠策店铺账单 → OMS 月结
-
-- 惠策缺少物料维度，因此不强行补物料。
-- 主维度：月份 + 惠策店铺/OMS 客户映射。
-- 主金额口径：惠策系统对账成功金额与 OMS 月结金额。
-- 辅助金额口径：惠策应收金额、实收金额分别与 OMS 月结金额比较。
-- 店铺映射：优先使用共同平台订单形成的桥接关系；无法桥接时使用旺店通同名店铺映射。
-- 本环节不将 OMS 未开票池与惠策继续核对。
-
-### 4.3 订单—账单证据 → OMS 月结数量
-
-- 惠策仅用于证明平台订单已进入账单，不作为数量来源。
-- 数量 A：平台订单号在惠策出现的旺店通商品数量。
-- 数量 B：OMS 月结 Y001 的原生商品数量。
-- 维度：发货月份 + 店铺/客户 + SAP 物料。
-- 多对一数据先按共同维度归并；数量一致组剔除，差异组及单边记录保留。
-
-### 4.4 OMS 月结 → SAP 发票
-
-- 主键：OMS 销售单号 + 物料编码 + 销售单位。
-- 比较：OMS 与 SAP 的数量和含税金额。
-- 匹配成功后执行双向字段辅助：
-  - OMS 向 SAP 补充出库月份、客户编码和客户名称；
-  - SAP 向 OMS 补充发票号、发票数量和含税金额。
-- 仅 SAP 存在的键保留为例外，不能据此反向推定客户或店铺。
-
-## 5. 当前主要结果
-
-### 5.1 订单与账单
-
-- 旺店通平台订单：4,612,650 单。
-- 惠策平台订单：5,683,439 单。
-- 单号及应收/实收金额一致：4,289,599 组，占旺店通平台订单的 93.00%。
-- 一致组旺店通金额：250,018,449.49 元，占订单级可核对金额池的 93.64%。
-- 主要差异池：236,808 组单号一致但金额不同、86,243 组仅订单、1,157,032 组仅账单。
-
-### 5.2 惠策店铺账单与 OMS 月结
-
-- 惠策系统对账成功金额：261,238,228.35 元。
-- OMS 月结金额：280,247,849.59 元。
-- OMS 较惠策成功金额高 19,009,621.24 元；惠策成功金额/OMS 为 93.22%。
-- 惠策应收金额：355,131,630.07 元，为 OMS 的 126.72%。
-- 惠策实收金额：254,075,745.41 元，为 OMS 的 90.66%。
-- 店铺应收金额映射覆盖率：99.94%；未映射应收金额 196,062.72 元。
-- 月份+店铺层面成功金额一致 21 组，金额差异 109 组，另有店铺未映射 16 组、仅 OMS 16 组、仅账单 4 组。
-
-### 5.3 数量核对
-
-- 旺店通全量商品数量：17,980,242；OMS 月结数量：17,870,519。
-- OMS－旺店通全量数量差异：-109,723；旺店通/OMS 为 100.61%。
-- 有惠策账单证据的旺店通数量：17,415,026，为 OMS 的 97.45%。
-- 共同月份+店铺+物料范围：旺店通 16,550,111，OMS 16,689,997，净差异 139,886，旺店通/OMS 为 99.16%。
-- 总体接近不代表逐组一致：数量完全一致 345 组，数量差异 2,799 组，其余为单边或店铺未映射记录。
-
-### 5.4 OMS 与 SAP
-
-- 双向字段一致：11,776 个键。
-- 匹配键覆盖率：99.33%。
-- 匹配键 OMS 数量：17,868,882，占 OMS 月结总数量的 99.99%。
-- 一致键 SAP 金额 280,229,212.42 元，OMS 金额 280,229,211.04 元，金额尾差 1.38 元。
-- 另有 80 个仅 SAP 键，数量 829,500，金额 9,293,843.92 元，已保留为例外。
-
-## 6. 输出文件
-
-### 6.1 主底稿
-
-当前主底稿：
-
-`outputs/sales_toc_workpaper_20260101_20260630/销售ToC业务流程核对底稿_20260101-20260630.xlsx`
-
-历史工作底稿保留在 `outputs/` 目录，不作为当前交付文件。
-
-工作簿共 13 张表：
-
-1. 全局口径与总览
-2. 业务流程与单对单规则
-3. 订单-账单汇总
-4. 订单-账单明细
-5. 账单-OMS月结汇总
-6. 账单-OMS月结明细
-7. 数量核对汇总
-8. 数量核对明细
-9. OMS月结-SAP汇总
-10. OMS-SAP字段映射
-11. 月度全流程汇总
-12. 店铺客户映射
-13. 完整明细索引
-
-### 6.2 完整结果
-
-`reconciliation/output_flow_v4/` 保存完整 CSV、工作簿展示用 JSON 和汇总 JSON：
-
-- `order_bill_recon.csv`：订单—账单完整结果，5,769,682 行。
-- `bill_oms_month_recon.csv`：账单—OMS 月结结果，166 行。
-- `order_bill_oms_qty_recon.csv`：数量结果，4,855 行。
-- `oms_sap_field_map.csv`：OMS—SAP 字段映射，11,856 行。
-- `huice_shop_map.csv`：店铺—客户映射，150 行。
-- `summary_v4.json`：底稿汇总指标的标准输出。
-
-Excel 对订单—账单明细仅嵌入异常优先的 15,000 行，完整明细应以 CSV 为准。
-
-### 6.3 代码
-
-- `reconciliation/reconcile_sales_flow_v4.py`：执行数据筛选、钩稽、汇总并导出 CSV/JSON。
-- `reconciliation/build_sales_flow_v4.mjs`：根据 V4 输出生成并检查 Excel 底稿。
-- `reconciliation/work_full/reconciliation.db`：当前核对使用的 SQLite 中间数据库。
-
-## 7. 重跑方法
-
-在项目根目录执行：
+## 🚀 安装
 
 ```bash
-python3 reconciliation/reconcile_sales_flow_v4.py
-node reconciliation/build_sales_flow_v4.mjs
+git clone https://github.com/Gvmeakiss/miaoke-sales-to-c.git
+cd miaoke-sales-to-c
+pip install -r requirements.txt
+# Node 侧需能解析 @oai/artifact-tool（见下方重跑说明）
 ```
 
-第二步依赖 `@oai/artifact-tool`。如普通 Node 环境无法解析该包，应先加载 Codex 工作区提供的依赖运行环境。
+## 💡 快速开始 / 使用示例
 
-重跑后至少检查：
+主流程（2026 年 1–6 月）：
+
+```bash
+# 1) Python：抽取、钩稽、写 SQLite 与 CSV/JSON
+python3 reconciliation/reconcile_sales_flow_v4.py
+
+# 2) Node：根据 output_flow_v4 产物生成 Excel 底稿
+node reconciliation/build_sales_flow_v4.mjs
+# 可用环境变量覆盖输出位置：
+#   SALES_TOC_OUTPUT_DIR / SALES_TOC_OUTPUT_FILE
+```
+
+其它可单独运行的脚本：
+
+```bash
+python3 reconciliation/reconcile_sales_toc.py        # ToC 全链路核对（流式读 xlsx）
+python3 reconciliation/reconcile_huice_oms.py        # 惠策↔OMS 月结核对
+python3 reconciliation/explore_wdt_oms_matching.py   # 旺店通↔OMS 店铺映射探索
+python3 订单数据分析_财务版.py                        # 订单财务口径分析
+```
+
+重跑后校验 Excel 完整性（示例文件名以实际输出为准）：
 
 ```bash
 unzip -t 'outputs/sales_toc_flow_v4_20260101_20260630/销售ToC业务流程核对底稿_V4_20260101-20260630.xlsx'
 ```
 
-Excel 构建脚本还会扫描 `#REF!`、`#DIV/0!`、`#VALUE!`、`#NAME?` 和 `#N/A`，并生成 `_qa_previews/` 供页面复核。
+## 🧠 核心逻辑（方法论）
 
-## 8. 后续跟进清单
+1. **抽取与标准化**：`reconcile_sales_toc.py` / `reconcile_huice_oms.py` 用 `lxml` 流式读取旺店通订单、惠策明细/汇总、OMS SQL、SAP 发票清单（`input/` 下 `旺店通订单清单/`、`惠策系统对账单清单/`、`惠策系统对账单汇总/`、`OMS ...2C单据.sql`、`发票清单：26.01.01-26.06.30/`），写入 `work_full/reconciliation.db`。
+2. **分段 pairwise 钩稽**（`reconcile_sales_flow_v4.py`，期间 `START="2026-01-01"` 至 `END_EXCLUSIVE="2026-07-01"`）：
+   - 订单→账单：按 `旺店通原始单号 = 惠策平台订单号`，金额差异 `ABS(...) <= 0.01` 判为一致；
+   - 账单→OMS 月结：按 `月份 + 店铺/客户映射`，惠策成功金额 vs OMS 月结金额；
+   - 数量核对：惠策证据数量 vs OMS 月结 Y001 数量，差异 `<= 0.000001` 判为数量一致；
+   - OMS 月结→SAP：按 `OMS销售单号 + 物料编码 + 销售单位` 比较数量与含税金额，双向补充字段，仅 SAP 存在的键保留为例外。
+3. **导出**：`export()` 写出 `output_flow_v4/` 下分项 CSV（`order_bill_recon.csv`、`bill_oms_month_recon.csv`、`order_bill_oms_qty_recon.csv`、`oms_sap_field_map.csv`、`huice_shop_map.csv`）与 `summary_v4.json`。
+4. **底稿构建**：`build_sales_flow_v4.mjs` 等读取 CSV/JSON 生成带审计格式的 Excel，并扫描公式错误生成 `_qa_previews/`。程序仅呈现差异与匹配率，不自动构成会计调整或审计结论。
 
-后续工作应集中在现有资料内的差异解释和证据留存：
+## 📋 输入与输出
 
-1. 对订单—账单的“单号一致金额差异”“仅订单”“仅账单”按金额从高到低抽样，区分退款、平台费用、结算时点和订单状态影响。
-2. 对账单—OMS 的 109 个金额差异组合逐月、逐店铺分析，优先关注绝对金额较大的组合。
-3. 对 16 个店铺未映射组合和 16 个仅 OMS 组合复核现有店铺—客户映射，不依赖新增资料强行配对。
-4. 对数量差异的 2,799 个共同组合优先分析高数量差异项目；总体 99.16% 不能替代逐项异常判断。
-5. 对 80 个仅 SAP 键单独检查开票期间、OMS 业务类型、单位和销售单号，禁止用 SAP 单边数据推定客户店铺。
-6. 财务报告引用核对结果时，应同时披露数据期间、金额口径和限制，不将总体接近直接表述为逐笔一致。
+- **输入**：`input/` 下客户导出的旺店通订单、惠策对账明细/汇总、OMS 日结月结 SQL（仅 `Y001` 月结）、SAP 2026 年 1–6 月发票清单（仅标准发票 2C）。
+- **中间数据**：`reconciliation/work_full/reconciliation.db`（SQLite，运行时生成）。
+- **输出**：
+  - `reconciliation/output_flow_v4/`：完整 CSV 与汇总 `summary_v4.json`（订单—账单约 576 万行、账单—OMS 月结、数量、OMS—SAP 字段映射、店铺—客户映射等）；
+  - `outputs/`：Excel 核对底稿（主底稿「销售ToC业务流程核对底稿_20260101-20260630.xlsx」含 13 张表；数据流/全链路底稿各版本）；Excel 对订单—账单明细仅嵌入异常优先的有限行，完整明细以 CSV 为准。
 
-## 9. 重要限制
+## ⚠️ 注意事项
 
-- 惠策没有可用商品级物料和数量，因此惠策不能直接参与商品数量钩稽。
-- 订单、账单、发运和开票的业务时点不同，跨月和退款等情况可能形成合理差异。
-- 惠策的成功金额、应收金额和实收金额含义不同，不能相互替代；成功金额为本项目对 OMS 的主比较口径。
-- 多对一汇总可提高可核对范围，但可能抵销单笔差异，因此完整异常明细仍需保留。
-- 本项目结果用于财务核对和异常定位，不自动构成会计调整、收入确认或审计结论。
+- 数据脱敏：仓库不含真实客户业务数据，示例与说明均为脱敏/合成数据；实际运行需将客户导出文件放入 `input/`。
+- 口径说明：核对期间、金额/数量阈值、业务范围（Y001、2C）以代码与仓库核对口径说明为准，本 README 仅作说明。
+- 重要限制：惠策无商品级物料与数量，不能直接参与商品数量钩稽；订单、账单、发运、开票业务时点不同，跨月与退款可能形成合理差异；多对一汇总会提高可核对范围但可能抵销单笔差异，完整异常明细仍需保留。
+- 审计结论：本项目结果用于财务核对与异常定位，不自动构成会计调整、收入确认或审计结论。
+
+## 🔗 相关仓库
+
+- https://github.com/Gvmeakiss/miaoke-sales-to-b-2026
+- https://github.com/Gvmeakiss/miaoke-sales-to-b-2025
+- https://github.com/Gvmeakiss/sales-three-match-miaoke-2026
+- https://github.com/Gvmeakiss/sales-three-match-newhope-2026
+
+## 📄 License
+
+MIT（详见仓库 `LICENSE`）。
 
 ---
 
 <div align="center">
 
-**James Li · 审计数据分析工具集**
-
-📫 本工具用于内部审计与数据核对，辅助分析但不替代专业判断，不作为对外签字版本。
+*Disclaimer: Personal project and personal views. Not affiliated with or endorsed by KPMG or any client.*<br>
+*本仓库为个人项目与个人观点，与任何前/现雇主及客户无关。*
 
 </div>
