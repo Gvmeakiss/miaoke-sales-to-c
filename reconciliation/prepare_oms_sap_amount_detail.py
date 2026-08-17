@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from reconcile_sales_toc import as_number, iter_selected_rows, text
+from reconcile_sales_toc import as_number, correct_sap_oms_sales_no, iter_selected_rows, text
 from oms_transaction_codes import OMS_STANDARD_SETTLEMENT_CODES, sql_list
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,16 +39,18 @@ def iso_date(value: object) -> str:
 
 def collect_sap_attributes() -> dict[tuple[str, str, str], dict[str, set[str]]]:
     attributes: dict[tuple[str, str, str], dict[str, set[str]]] = defaultdict(
-        lambda: {"invoices": set(), "creation_dates": set(), "posting_dates": set(), "customer_codes": set(), "customer_names": set()}
+        lambda: {"original_oms_sales_nos": set(), "invoices": set(), "creation_dates": set(), "posting_dates": set(), "customer_codes": set(), "customer_names": set()}
     )
     selected = [1, 6, 15, 16, 17, 26, 27, 32, 44]
     for path in sorted(SAP_DIR.glob("*.XLSX")):
         for _, values in iter_selected_rows(path, selected):
             if text(values.get(15)) != "标准发票（2C)":
                 continue
-            key = (text(values.get(1)), text(values.get(32)), text(values.get(44)))
+            original_oms_sales_no = text(values.get(1))
+            key = (correct_sap_oms_sales_no(original_oms_sales_no), text(values.get(32)), text(values.get(44)))
             item = attributes[key]
             pairs = (
+                ("original_oms_sales_nos", original_oms_sales_no),
                 ("invoices", text(values.get(6))),
                 ("creation_dates", iso_date(values.get(26))),
                 ("posting_dates", iso_date(values.get(27))),
@@ -106,6 +108,7 @@ def main() -> None:
             "sap_customer_code": joined(attr.get("customer_codes", set())),
             "sap_customer_name": joined(attr.get("customer_names", set())),
             "sap_invoice_amount": sap_amount,
+            "sap_original_oms_sales_no": joined(attr.get("original_oms_sales_nos", set())) or (record["oms_sales_no"] or ""),
             "oms_monthly_document_no": record["oms_sales_no"] or "",
             "oms_monthly_amount": oms_amount,
             "material_code": record["material_code"] or "",

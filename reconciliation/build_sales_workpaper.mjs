@@ -16,8 +16,8 @@ const formalDetailManifest = await fs.readFile(path.join(formalDetailDir, "明�
 const S = await read("summary.json");
 const cutoffSensitivity = await read("wdt_cutoff_sensitivity.json").catch(() => ({ data_check: {}, sensitivity: [], definitions: {} }));
 const settlementOms = await read("settlement_oms_workpaper.json").catch(() => ({ definitions: {}, summary_rows: [], available_total: {}, detail_headers: [], detail_rows: [] }));
+const settlementHuice = await read("settlement_vs_huice_reconciliation.json").catch(() => ({ scopes: [], category_summary: [], exception_detail: { headers: [], preview_rows: [] }, keys: {}, amounts: {} }));
 const data = {
-  internal: await read("huice_internal_recon_workbook.json"),
   omsSap: await read("oms_sap_field_map_workbook.json"),
   shop: await read("huice_shop_map_workbook.json"),
 };
@@ -28,11 +28,11 @@ const names = [
   "2.OMS月结-SAP汇总",
   "3.对账结果-OMS月结汇总",
   "4.对账结果-OMS月结明细",
-  "5.数量核对汇总",
-  "6.数量核对明细",
-  "7.旺店通订单匹配明细",
-  "8.惠策内部核对汇总",
-  "9.惠策内部核对明细",
+  "5.对账结果-惠策汇总",
+  "6.对账结果-惠策明细",
+  "7.数量核对汇总",
+  "8.数量核对明细",
+  "9.旺店通订单匹配明细",
   "10.店铺客户映射",
 ];
 for (const name of names) wb.worksheets.add(name);
@@ -80,6 +80,9 @@ const headerZh = {
   reconciliation_rows: "发货对账行数", reconciliation_amount: "发货对账收款金额", reconciliation_quantity: "发货对账实际数量", oms_quantity: "OMS月结数量", amount_match_rate: "金额匹配率", quantity_match_rate: "数量匹配率",
   source_files: "来源文件", settlement_periods: "原账期范围", business_months: "业务发生月份", cross_period_flag: "跨期补充标识",
   cross_period_adjustment_amount: "跨期结算调整金额", adjusted_reconciliation_amount: "调整后发货对账金额", adjusted_amount_difference: "调整后金额差异", adjusted_amount_match_rate: "调整后金额匹配率", adjustment_basis: "跨期调整依据",
+  platform_order_no: "平台订单号", settlement_months: "发货对账账期", huice_bill_months: "惠策账单月份", huice_platforms: "惠策平台", huice_shops: "惠策店铺",
+  settlement_rows: "发货对账成功行数", huice_rows: "惠策账单行数", huice_success_rows: "惠策成功行数", huice_failed_rows: "惠策失败行数",
+  settlement_amount: "发货对账成功金额", huice_success_cash: "惠策成功实际实收", huice_all_status_cash: "惠策全状态实际实收", reason: "差异说明",
 };
 function detail(name, reportTitle, subtitle, dataset, widths = {}, omit = []) {
   const keep = dataset.headers.map((h, i) => ({ h, i })).filter(x => !omit.includes(x.h));
@@ -95,7 +98,8 @@ function detail(name, reportTitle, subtitle, dataset, widths = {}, omit = []) {
   sheet.freezePanes.freezeRows(4); sheet.freezePanes.freezeColumns(Math.min(2, headers.length));
 }
 const by = (arr, key) => Object.fromEntries(arr.map(x => [x[key], x]));
-const ctl = S.controls, orderResults = S.order_bill_results, internalResults = S.huice_internal_results;
+const ctl = S.controls, orderResults = S.order_bill_results;
+const sapOrderCorrections = S.sap_oms_sales_no_corrections || [];
 const omsSapResults = S.oms_sap_results, exactMap = by(omsSapResults, "mapping_result")["双向字段一致"] || { keys: 0, sap_qty: 0, oms_qty: 0, sap_amount: 0, oms_amount: 0 };
 const findResult = (rows, label) => rows.find(x => x.result === label) || { groups: 0, wdt_amount: 0, bill_cash: 0, detail_cash: 0, summary_cash: 0, oms_amount: 0, oms_qty: 0, order_bill_qty: 0 };
 const findMap = label => omsSapResults.find(x => x.mapping_result === label) || { keys: 0, sap_qty: 0, oms_qty: 0, sap_amount: 0, oms_amount: 0 };
@@ -112,25 +116,19 @@ const cutoffDecember = (cutoffSensitivity.sensitivity || []).find(x => x.range =
 const settlementSummary = settlementOms.summary_rows || [];
 const settlementTotal = settlementOms.available_total || {};
 const settlementDetail = { headers: settlementOms.detail_headers || [], rows: settlementOms.detail_rows || [] };
+const settlementHuiceScope = (settlementHuice.scopes || []).find(x => String(x.scope || "").startsWith("正式范围")) || {};
+const settlementHuiceCategories = settlementHuice.category_summary || [];
+const settlementHuiceCategory = label => settlementHuiceCategories.find(x => x.result === label) || { order_count: 0, settlement_rows: 0, huice_rows: 0, settlement_amount: 0, huice_success_cash: 0, huice_all_status_cash: 0, amount_difference: 0, amount_match_rate: null };
+const settlementHuiceExact = settlementHuiceCategory("金额一致");
+const settlementHuiceTotalSettlement = settlementHuiceCategories.reduce((sum, x) => sum + (x.settlement_amount || 0), 0);
+const settlementHuiceTotalCash = settlementHuiceCategories.reduce((sum, x) => sum + (x.huice_success_cash || 0), 0);
+const settlementHuiceException = settlementHuice.exception_detail || { headers: [], preview_rows: [] };
+const settlementHuiceExceptionDataset = { headers: settlementHuiceException.headers || [], rows: settlementHuiceException.preview_rows || [] };
 const monthLabel = month => String(month || "").replace(/^(\d{4})-(\d{2})$/, (_, year, value) => `${year}年${Number(value)}月`);
 const availableMonthsLabel = (settlementTotal.available_months || []).map(monthLabel).join("、") || "暂无";
 const pendingMonthsLabel = (settlementTotal.pending_months || settlementSummary.filter(x => !String(x.status || "").startsWith("已完成核对")).map(x => x.month)).map(monthLabel).join("、") || "无";
 const hasPendingSettlementMonths = pendingMonthsLabel !== "无";
 const settlementRangeNote = `已完成月份：${availableMonthsLabel}${hasPendingSettlementMonths ? `；待补月份：${pendingMonthsLabel}` : "；1—6月资料已齐"}`;
-
-// 场景2：惠策明细—店铺汇总，仅保留实际实收。
-const internalRefs = {};
-{
-  const sheet = ws("8.惠策内部核对汇总"); title(sheet, "惠策明细—惠策店铺汇总实际实收核对汇总", "两份惠策清单均按导出结算月份+平台+店铺核对。", "H");
-  section(sheet, "A4:H4"); sheet.getRange("A4").values = [["金额字段定义"]]; sheet.getRange("A4:H4").merge();
-  write(sheet, 4, 0, [["金额项目", "来源清单", "原始字段", "计算逻辑", "总额", "勾稽用途", "对应总览项目", "备注"]]); header(sheet, "A5:H5");
-  write(sheet, 5, 0, [["惠策明细实际实收", "惠策账单清单（含历史遗漏补充）", "收款金额（正实收）；退款金额（负实收）", "按对账流水号去重后计算净额=收款金额-退款金额，再按结算月+平台+店铺汇总", null, "明细侧", "惠策内部", "合并后唯一账单记录"], ["惠策汇总实际结算", "惠策店铺汇总清单+历史遗漏补充", "成功金额；不一致实收金额；单边实收金额；补充明细净实收", "原店铺汇总实际结算金额+补充明细净实收，再按结算月+平台+店铺汇总", null, "汇总侧", "惠策内部", "核对层重构，不修改原文件"]]); body(sheet, "A6:H7"); sheet.getRange("A6:H7").format.wrapText = true; sheet.getRange("A6:H7").format.rowHeight = 36;
-  formula(sheet, "E6", `=SUM(C11:C${10 + Math.max(1, internalResults.length)})`); formula(sheet, "E7", `=SUM(D11:D${10 + Math.max(1, internalResults.length)})`); sheet.getRange("E6:E7").setNumberFormat("#,##0.00;[Red](#,##0.00);-");
-  section(sheet, "A9:H9"); sheet.getRange("A9").values = [["分类金额及匹配率"]]; sheet.getRange("A9:H9").merge(); write(sheet, 9, 0, [["核对结果", "月份/平台/店铺组合数", "惠策明细实际实收", "惠策汇总实际结算", "差异（汇总-明细）", "金额匹配率", "分类处理", "备注"]]); header(sheet, "A10:H10");
-  const rows = internalResults.length ? internalResults.map(x => [x.result, x.groups || 0, x.detail_cash || 0, x.summary_cash || 0, null, null, x.result === "实收一致" ? "金额一致分类" : "差异分类", "按结算月份+平台+店铺核对"]) : [["无记录", 0, 0, 0, null, null, "分类列示", ""]]; write(sheet, 10, 0, rows); const first = 11, last = 10 + rows.length, total = last + 1; internalRefs.totalRow = total; internalRefs.categoryRows = Object.fromEntries(rows.map((x, i) => [x[0], first + i]));
-  for (let r = first; r <= last; r++) { formula(sheet, `E${r}`, `=D${r}-C${r}`); formula(sheet, `F${r}`, `=IFERROR(MIN(ABS(C${r}),ABS(D${r}))/MAX(ABS(C${r}),ABS(D${r})),0)`); }
-  write(sheet, total - 1, 0, [["合计", null, null, null, null, null, "分类合计与总览勾稽", ""]]); formula(sheet, `B${total}`, `=SUM(B${first}:B${last})`); formula(sheet, `C${total}`, `=SUM(C${first}:C${last})`); formula(sheet, `D${total}`, `=SUM(D${first}:D${last})`); formula(sheet, `E${total}`, `=D${total}-C${total}`); formula(sheet, `F${total}`, `=IFERROR(MIN(ABS(C${total}),ABS(D${total}))/MAX(ABS(C${total}),ABS(D${total})),0)`); body(sheet, `A11:H${total}`); status(sheet, `A11:A${last}`); sheet.getRange(`B11:B${total}`).setNumberFormat("#,##0"); sheet.getRange(`C11:E${total}`).setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange(`F11:F${total}`).setNumberFormat("0.00%"); sheet.getRange(`A${total}:H${total}`).format = { fill: C.green, font: { bold: true, color: C.greenText }, borders: { top: { style: "medium", color: C.blue } } }; [30, 18, 20, 20, 20, 17, 22, 28].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.getRange("A6:H7").format.wrapText = true; sheet.freezePanes.freezeRows(10);
-}
 
 // 场景3：发货对账结果—OMS月结。替代原惠策账单—OMS月结主链生态位。
 const settlementOmsRefs = {};
@@ -161,10 +159,50 @@ const settlementOmsRefs = {};
   [18, 26, 19, 19, 19, 18, 21, 19, 20, 17, 17, 19, 19, 44, 46].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.freezePanes.freezeRows(5);
 }
 
-// 场景4：数量沿业务流分两步核对，不进行四方直接比较。
+// 场景4：发货对账结果—惠策账单。惠策无原生商品数量，本层只执行平台订单号及金额核对。
+const settlementHuiceRefs = {};
+{
+  const sheet = ws("5.对账结果-惠策汇总");
+  title(sheet, "发货对账结果—惠策账单金额核对汇总", "仅核对2026年1—6月发货对账成功记录；按平台订单号汇总后比较惠策对账成功实际实收。惠策账单无原生商品数量，本层不执行数量核对。", "I");
+  section(sheet, "A4:I4"); sheet.getRange("A4").values = [["订单级分类金额及匹配率"]]; sheet.getRange("A4:I4").merge();
+  write(sheet, 4, 0, [["核对结果", "平台订单数", "发货对账成功行数", "惠策账单行数", "发货对账成功金额", "惠策对账成功实际实收", "差异（发货对账-惠策）", "金额匹配率", "分类说明"]]); header(sheet, "A5:I5");
+  const categoryRows = settlementHuiceCategories.length ? settlementHuiceCategories.map(x => [
+    x.result, x.order_count || 0, x.settlement_rows || 0, x.huice_rows || 0,
+    x.settlement_amount || 0, x.huice_success_cash || 0, x.amount_difference || 0,
+    x.amount_match_rate ?? null,
+    x.result === "金额一致" ? "平台订单号命中且双方对账成功金额差不超过0.01元" : x.result === "金额差异" ? "平台订单号命中但双方对账成功金额存在差异" : x.result === "仅发货对账" ? "惠策无对应平台订单号" : "2026年1—6月发货对账成功记录无对应平台订单号",
+  ]) : [["无记录", 0, 0, 0, 0, 0, 0, null, "待刷新核对结果"]];
+  write(sheet, 5, 0, categoryRows); const first = 6, last = 5 + categoryRows.length, total = last + 1; settlementHuiceRefs.totalRow = total; settlementHuiceRefs.categoryRows = Object.fromEntries(categoryRows.map((x, i) => [x[0], first + i]));
+  settlementHuiceRefs.exactRow = settlementHuiceRefs.categoryRows["金额一致"] || first;
+  write(sheet, total - 1, 0, [["合计", null, null, null, null, null, null, null, "分类合计与总览勾稽"]]);
+  for (const c of ["B","C","D","E","F","G"]) formula(sheet, `${c}${total}`, `=SUM(${c}${first}:${c}${last})`);
+  formula(sheet, `H${total}`, `=IFERROR(MIN(ABS(E${total}),ABS(F${total}))/MAX(ABS(E${total}),ABS(F${total})),0)`);
+  body(sheet, `A6:I${total}`); status(sheet, `A6:A${last}`); sheet.getRange(`B6:D${total}`).setNumberFormat("#,##0"); sheet.getRange(`E6:G${total}`).setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange(`H6:H${total}`).setNumberFormat("0.00%"); sheet.getRange(`A6:I${total}`).format.wrapText = true; sheet.getRange(`A${total}:I${total}`).format = { fill: C.green, font: { bold: true, color: C.greenText }, borders: { top: { style: "medium", color: C.blue } } };
+
+  const controlSection = total + 2; section(sheet, `A${controlSection}:I${controlSection}`); sheet.getRange(`A${controlSection}`).values = [["总体覆盖及审计口径"]]; sheet.getRange(`A${controlSection}:I${controlSection}`).merge();
+  write(sheet, controlSection, 0, [["控制指标", "分子", "分母", "结果", "数据来源", "匹配键", "金额口径", "数量口径", "明细支持"]]); header(sheet, `A${controlSection + 1}:I${controlSection + 1}`);
+  write(sheet, controlSection + 1, 0, [
+    ["发货对账成功订单号覆盖率", settlementHuiceScope.common_success_orders || 0, settlementHuiceScope.settlement_success_orders || 0, null, "发货对账结果 vs 惠策账单", "双方原始字段：平台订单号", "不适用", "不执行：惠策无原生商品数量", "6.对账结果-惠策明细"],
+    ["逐订单金额一致覆盖率", settlementHuiceExact.settlement_amount || 0, settlementHuiceTotalSettlement || 0, null, "发货对账结果 vs 惠策账单", "平台订单号汇总后金额差≤0.01元", "发货对账收款金额（对账成功） vs 惠策实际实收（对账成功）", "不执行：惠策无原生商品数量", "完整差异及单边CSV+Sheet预览"],
+  ]);
+  formula(sheet, `D${controlSection + 2}`, `=IFERROR(B${controlSection + 2}/C${controlSection + 2},0)`); formula(sheet, `D${controlSection + 3}`, `=IFERROR(B${controlSection + 3}/C${controlSection + 3},0)`);
+  body(sheet, `A${controlSection + 2}:I${controlSection + 3}`); sheet.getRange(`B${controlSection + 2}:C${controlSection + 2}`).setNumberFormat("#,##0"); sheet.getRange(`B${controlSection + 3}:C${controlSection + 3}`).setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange(`D${controlSection + 2}:D${controlSection + 3}`).setNumberFormat("0.00%"); sheet.getRange(`A${controlSection + 2}:I${controlSection + 3}`).format.wrapText = true; sheet.getRange(`A${controlSection + 2}:I${controlSection + 3}`).format.rowHeight = 46;
+
+  const note = controlSection + 5; section(sheet, `A${note}:I${note}`); sheet.getRange(`A${note}`).values = [["Notes:"]]; sheet.getRange(`A${note}:I${note}`).merge();
+  const notes = [
+    "1. 发货对账汇总单号以FHDZS开头，惠策对账流水号以DZ开头，两者不是同一业务键；本核对仅使用双方均存在的原始字段“平台订单号”。",
+    "2. 发货对账仅纳入对账状态=对账成功，金额取收款金额；惠策金额取收款金额（正实收）-退款金额（负实收），并仅纳入惠策对账状态=对账成功。",
+    `3. Sheet展示前${(settlementHuiceException.preview_limit || 0).toLocaleString("zh-CN")}条差异及单边记录；完整${(settlementHuiceException.row_count || 0).toLocaleString("zh-CN")}条记录见同目录“${settlementHuiceException.file || "发货对账-惠策账单差异及单边明细.csv"}”。`,
+    "4. 惠策账单明细未提供商品编码及商品数量，因此本层不执行商品级或数量核对，也不以发货数量代替惠策数量。",
+  ];
+  notes.forEach((text, index) => { const row = note + 1 + index; sheet.getRange(`A${row}:I${row}`).merge(); sheet.getRange(`A${row}`).values = [[text]]; }); body(sheet, `A${note + 1}:I${note + 4}`); sheet.getRange(`A${note + 1}:I${note + 4}`).format.wrapText = true; sheet.getRange(`A${note + 1}:I${note + 4}`).format.rowHeight = 32;
+  [24, 18, 20, 18, 22, 22, 22, 17, 46].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.freezePanes.freezeRows(5);
+}
+
+// 场景5：数量沿业务流分两步核对，不对无数量字段的惠策账单执行数量比较。
 const qtyRefs = {};
 {
-  const sheet = ws("5.数量核对汇总"); title(sheet, "销售数量逐层核对汇总", "Step 1为发货对账结果—OMS月结（仅已获取月份）；Step 2为OMS月结—SAP标准发票（2C）。", "K");
+  const sheet = ws("7.数量核对汇总"); title(sheet, "销售数量逐层核对汇总", "Step 1为发货对账结果—OMS月结（仅已获取月份）；Step 2为OMS月结—SAP标准发票（2C）。", "K");
   section(sheet, "A4:K4"); sheet.getRange("A4").values = [["Step 1｜OMS月结数量 vs 发货对账实际数量"]]; sheet.getRange("A4:K4").merge();
   write(sheet, 4, 0, [["核对步骤", "左侧数量项目", "来源系统/原始清单", "使用字段/汇总逻辑", "左侧数量", "右侧数量项目", "来源系统/原始清单", "使用字段/汇总逻辑", "右侧数量", "差异数量（右-左）", "差异率"]]); header(sheet, "A5:K5");
   write(sheet, 5, 0, [["Step 1", "OMS月结共同键数量", "OMS系统日结月结查询记录SQL", `item_num；Y001按月份+客户编码+商品编码共同键汇总；${settlementRangeNote}`, settlementTotal.oms_common_quantity ?? null, "发货对账共同键实际数量", "对账明细（to oms 月结）", `实际数量；对账成功记录按月份+店铺编码+货品编码共同键汇总；${settlementRangeNote}`, settlementTotal.reconciliation_common_quantity ?? null, null, null]]); formula(sheet, "J6", "=I6-E6"); formula(sheet, "K6", "=IFERROR(ABS(J6)/MAX(ABS(E6),ABS(I6)),0)"); qtyRefs.step1Row = 6;
@@ -172,7 +210,7 @@ const qtyRefs = {};
   write(sheet, 8, 0, [["核对步骤", "左侧数量项目", "来源系统/原始清单", "使用字段/汇总逻辑", "左侧数量", "右侧数量项目", "来源系统/原始清单", "使用字段/汇总逻辑", "右侧数量", "差异数量（右-左）", "差异率"]]); header(sheet, "A9:K9");
   write(sheet, 9, 0, [["Step 2", "OMS共同键数量", "OMS系统日结月结查询记录SQL", "item_num；销售单号+物料+销售单位共同键汇总", exactMap.oms_qty || 0, "SAP共同键数量", "SAP开票清单", "invoice_qty；标准发票（2C）共同键汇总", exactMap.sap_qty || 0, null, null]]); formula(sheet, "J10", "=I10-E10"); formula(sheet, "K10", "=IFERROR(ABS(J10)/MAX(ABS(E10),ABS(I10)),0)"); qtyRefs.step2Row = 10;
   body(sheet, "A6:K6"); body(sheet, "A10:K10"); sheet.getRange("E6:E10").setNumberFormat("#,##0"); sheet.getRange("I6:J10").setNumberFormat("#,##0"); sheet.getRange("K6:K10").setNumberFormat("0.00%"); sheet.getRange("A6:K10").format.wrapText = true; sheet.getRange("A6:K6").format.rowHeight = 48; sheet.getRange("A10:K10").format.rowHeight = 48;
-  write(sheet, 12, 0, [["明细支持", "6.数量核对明细 Step 1", "OMS月结—发货对账结果", "按月份+客户/店铺编码+商品/货品编码", null, "6.数量核对明细 Step 2", "OMS—SAP", "按销售单号+物料+销售单位", null, null, null]]); body(sheet, "A13:K13");
+  write(sheet, 12, 0, [["明细支持", "8.数量核对明细 Step 1", "OMS月结—发货对账结果", "按月份+客户/店铺编码+商品/货品编码", null, "8.数量核对明细 Step 2", "OMS—SAP", "按销售单号+物料+销售单位", null, null, null]]); body(sheet, "A13:K13");
   [14, 34, 30, 38, 17, 25, 30, 38, 17, 20, 16].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.freezePanes.freezeRows(5);
 }
 
@@ -191,21 +229,27 @@ const sapRefs = {};
   for (let r = 6; r <= 9; r++) { formula(sheet, `H${r}`, `=G${r}-D${r}`); formula(sheet, `I${r}`, `=IFERROR(MIN(ABS(D${r}),ABS(G${r}))/MAX(ABS(D${r}),ABS(G${r})),0)`); }
   sapRefs.totalAmountRow = 6; sapRefs.totalQtyRow = 7; sapRefs.commonAmountRow = 8; sapRefs.commonQtyRow = 9;
   body(sheet, "A6:K9"); sheet.getRange("D6:H6").setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange("D7:H7").setNumberFormat("#,##0"); sheet.getRange("D8:H8").setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange("D9:H9").setNumberFormat("#,##0"); sheet.getRange("I6:I9").setNumberFormat("0.00%"); sheet.getRange("A6:K9").format.wrapText = true; sheet.getRange("A6:K9").format.rowHeight = 46; sheet.getRange("A6:K9").format.fill = C.green;
+  section(sheet, "A11:K11"); sheet.getRange("A11").values = [["客户确认的SAP销售单号更正"]]; sheet.getRange("A11:K11").merge();
+  write(sheet, 11, 0, [["SAP原录入OMS销售单号", "更正后OMS销售单号", "SAP发票编号", "受影响SAP行数", "受影响数量", "受影响含税金额", "更正依据", "更正处理", "核对结果影响", "原始文件处理", "备注"]]); header(sheet, "A12:K12");
+  const correctionRows = sapOrderCorrections.length ? sapOrderCorrections.map(x => [x.original_oms_sales_no, x.corrected_oms_sales_no, x.sap_invoice_nos, x.affected_rows, x.affected_quantity, x.affected_amount, x.correction_basis, "仅在钩稽层映射更正", "按更正后单号重新执行OMS—SAP共同键核对", "原始SAP清单不修改", "更正前后单号及影响金额保留审计轨迹"]) : [["无", "无", "无", 0, 0, 0, "无客户确认更正", "N/A", "N/A", "原始清单不修改", ""]];
+  write(sheet, 12, 0, correctionRows); const correctionEnd = 12 + correctionRows.length; body(sheet, `A13:K${correctionEnd}`); sheet.getRange(`A13:C${correctionEnd}`).setNumberFormat("@"); sheet.getRange(`D13:E${correctionEnd}`).setNumberFormat("#,##0"); sheet.getRange(`F13:F${correctionEnd}`).setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange(`A13:K${correctionEnd}`).format.wrapText = true; sheet.getRange(`A13:K${correctionEnd}`).format.rowHeight = 42; sheet.getRange(`A13:K${correctionEnd}`).format.fill = C.amber;
   [18, 34, 38, 20, 28, 38, 20, 20, 16, 34, 24].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.freezePanes.freezeRows(5);
 }
 
-// 全局总览：主链展示SAP—OMS月结—发货对账结果；订单—账单稽核紧接数量核对列示。
+// 全局总览：主链展示SAP—OMS月结—发货对账结果—惠策账单；订单—账单稽核紧接数量核对列示。
 {
-  const sheet = ws("1.全局口径与总览"); title(sheet, "销售ToC三单匹配结果总览", "审计核对方向：SAP开票 → OMS月结 → 发货对账结果；订单—账单及12月追溯在数量核对下方单独稽核。", "P");
-  section(sheet, "A4:L4"); sheet.getRange("A4").values = [["金额匹配及逐层勾稽"]]; sheet.getRange("A4:L4").merge();
-  write(sheet, 4, 0, [["核对步骤", "参与匹配数据", "匹配字段/维度", "SAP开票总金额", "SAP开票匹配金额", "OMS月结总金额", "OMS月结匹配金额", "发货对账总金额", "发货对账匹配金额", "差异（前项-后项）", "金额匹配率", "匹配覆盖率"]]); header(sheet, "A5:L5");
+  const sheet = ws("1.全局口径与总览"); title(sheet, "销售ToC三单匹配结果总览", "审计核对方向：SAP开票 → OMS月结 → 发货对账结果 → 惠策账单；订单—账单及12月追溯在数量核对下方单独稽核。", "P");
+  section(sheet, "A4:N4"); sheet.getRange("A4").values = [["金额匹配及逐层勾稽"]]; sheet.getRange("A4:N4").merge();
+  write(sheet, 4, 0, [["核对步骤", "参与匹配数据", "匹配字段/维度", "SAP开票总金额", "SAP开票匹配金额", "OMS月结总金额", "OMS月结匹配金额", "发货对账总金额", "发货对账匹配金额", "惠策账单总金额", "惠策账单匹配金额", "差异（前项-后项）", "金额匹配率", "匹配覆盖率"]]); header(sheet, "A5:N5");
   write(sheet, 5, 0, [
-    ["1.SAP开票—OMS月结", "SAP标准发票（2C）—OMS Y001月结", "OMS销售单号+物料编码+销售单位", null, null, null, null, "N/A", "N/A", null, null, null],
-    ["2.OMS月结—发货对账结果（资料齐备期间）", "OMS Y001月结—发货对账成功记录", "月份+OMS客户/店铺编码+商品/货品编码", "N/A", "N/A", null, null, null, null, null, null, null],
+    ["1.SAP开票—OMS月结", "SAP标准发票（2C）—OMS Y001月结", "OMS销售单号+物料编码+销售单位", null, null, null, null, "N/A", "N/A", "N/A", "N/A", null, null, null],
+    ["2.OMS月结—发货对账结果（资料齐备期间）", "OMS Y001月结—发货对账成功记录", "月份+OMS客户/店铺编码+商品/货品编码", "N/A", "N/A", null, null, null, null, "N/A", "N/A", null, null, null],
+    ["3.发货对账结果—惠策账单", "发货对账成功记录—惠策对账成功账单", "双方原始平台订单号；订单汇总金额差≤0.01元", "N/A", "N/A", "N/A", "N/A", null, null, null, null, null, null, null],
   ]);
-  formula(sheet, "D6", `='2.OMS月结-SAP汇总'!G${sapRefs.totalAmountRow}`); formula(sheet, "E6", `='2.OMS月结-SAP汇总'!G${sapRefs.commonAmountRow}`); formula(sheet, "F6", `='2.OMS月结-SAP汇总'!D${sapRefs.totalAmountRow}`); formula(sheet, "G6", `='2.OMS月结-SAP汇总'!D${sapRefs.commonAmountRow}`); formula(sheet, "J6", "=ROUND(E6-G6,2)"); formula(sheet, "K6", "=IFERROR(MIN(ABS(E6),ABS(G6))/MAX(ABS(E6),ABS(G6)),0)"); formula(sheet, "L6", "=IFERROR(ABS(E6)/ABS(D6),0)");
-  formula(sheet, "F7", `='3.对账结果-OMS月结汇总'!D${settlementOmsRefs.totalRow}`); formula(sheet, "G7", `='3.对账结果-OMS月结汇总'!H${settlementOmsRefs.totalRow}`); formula(sheet, "H7", `='3.对账结果-OMS月结汇总'!C${settlementOmsRefs.totalRow}`); formula(sheet, "I7", `='3.对账结果-OMS月结汇总'!G${settlementOmsRefs.totalRow}`); formula(sheet, "J7", "=ROUND(G7-I7,2)"); formula(sheet, "K7", "=IFERROR(MIN(ABS(G7),ABS(I7))/MAX(ABS(G7),ABS(I7)),0)"); formula(sheet, "L7", "=IFERROR(ABS(G7)/ABS(F7),0)");
-  body(sheet, "A6:L7"); sheet.getRange("A6:L7").format.borders = { preset: "all", style: "thin", color: C.line }; sheet.getRange("D6:J7").setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange("K6:L7").setNumberFormat("0.00%"); sheet.getRange("A6:L7").format.wrapText = true; sheet.getRange("A6:L7").format.rowHeight = 54; sheet.getRange("A6:L7").format.fill = C.green;
+  formula(sheet, "D6", `='2.OMS月结-SAP汇总'!G${sapRefs.totalAmountRow}`); formula(sheet, "E6", `='2.OMS月结-SAP汇总'!G${sapRefs.commonAmountRow}`); formula(sheet, "F6", `='2.OMS月结-SAP汇总'!D${sapRefs.totalAmountRow}`); formula(sheet, "G6", `='2.OMS月结-SAP汇总'!D${sapRefs.commonAmountRow}`); formula(sheet, "L6", "=ROUND(E6-G6,2)"); formula(sheet, "M6", "=IFERROR(MIN(ABS(E6),ABS(G6))/MAX(ABS(E6),ABS(G6)),0)"); formula(sheet, "N6", "=IFERROR(ABS(E6)/ABS(D6),0)");
+  formula(sheet, "F7", `='3.对账结果-OMS月结汇总'!D${settlementOmsRefs.totalRow}`); formula(sheet, "G7", `='3.对账结果-OMS月结汇总'!H${settlementOmsRefs.totalRow}`); formula(sheet, "H7", `='3.对账结果-OMS月结汇总'!C${settlementOmsRefs.totalRow}`); formula(sheet, "I7", `='3.对账结果-OMS月结汇总'!G${settlementOmsRefs.totalRow}`); formula(sheet, "L7", "=ROUND(G7-I7,2)"); formula(sheet, "M7", "=IFERROR(MIN(ABS(G7),ABS(I7))/MAX(ABS(G7),ABS(I7)),0)"); formula(sheet, "N7", "=IFERROR(ABS(G7)/ABS(F7),0)");
+  formula(sheet, "H8", `='5.对账结果-惠策汇总'!E${settlementHuiceRefs.totalRow}`); formula(sheet, "I8", `='5.对账结果-惠策汇总'!E${settlementHuiceRefs.exactRow}`); formula(sheet, "J8", `='5.对账结果-惠策汇总'!F${settlementHuiceRefs.totalRow}`); formula(sheet, "K8", `='5.对账结果-惠策汇总'!F${settlementHuiceRefs.exactRow}`); formula(sheet, "L8", "=ROUND(I8-K8,2)"); formula(sheet, "M8", "=IFERROR(MIN(ABS(I8),ABS(K8))/MAX(ABS(I8),ABS(K8)),0)"); formula(sheet, "N8", "=IFERROR(ABS(I8)/ABS(H8),0)");
+  body(sheet, "A6:N8"); sheet.getRange("A6:N8").format.borders = { preset: "all", style: "thin", color: C.line }; sheet.getRange("D6:L8").setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange("M6:N8").setNumberFormat("0.00%"); sheet.getRange("A6:N8").format.wrapText = true; sheet.getRange("A6:N8").format.rowHeight = 54; sheet.getRange("A6:N8").format.fill = C.green;
 
   section(sheet, "A10:L10"); sheet.getRange("A10").values = [["数量匹配及逐层勾稽"]]; sheet.getRange("A10:L10").merge();
   write(sheet, 10, 0, [["核对步骤", "参与匹配数据", "匹配字段/维度", "SAP开票总数量", "SAP开票匹配数量", "OMS月结总数量", "OMS月结匹配数量", "发货对账总数量", "发货对账匹配数量", "差异（前项-后项）", "数量匹配率", "匹配覆盖率"]]); header(sheet, "A11:L11");
@@ -247,7 +291,7 @@ const sapRefs = {};
   body(sheet, "A40:H41"); sheet.getRange("A40:H40").format.fill = C.green; sheet.getRange("A41:H41").format.fill = C.amber; sheet.getRange("B40:F41").setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange("G40:H41").setNumberFormat("0.00%");
 
   section(sheet, "A44:B44"); sheet.getRange("A44").values = [["Lead｜执行总金额"]]; sheet.getRange("A44:B44").merge(); write(sheet, 44, 0, [["清单+字段", "执行总金额"]]); header(sheet, "A45:B45");
-  write(sheet, 45, 0, [["SAP开票清单｜含税金额（标准发票（2C））", null], ["OMS月结SQL｜share_amount（Y001）", null], ["发货对账结果｜收款金额（对账成功）", null]]); formula(sheet, "B46", "=D6"); formula(sheet, "B47", "=F6"); formula(sheet, "B48", "=H7"); body(sheet, "A46:B48"); sheet.getRange("A46:B48").format.borders = { preset: "all", style: "thin", color: C.line }; sheet.getRange("B46:B48").setNumberFormat("#,##0.00;[Red](#,##0.00);-");
+  write(sheet, 45, 0, [["SAP开票清单｜含税金额（标准发票（2C））", null], ["OMS月结SQL｜share_amount（Y001）", null], ["发货对账结果｜收款金额（对账成功）", null], ["惠策账单清单｜实际实收（对账成功）", null]]); formula(sheet, "B46", "=D6"); formula(sheet, "B47", "=F6"); formula(sheet, "B48", "=H7"); formula(sheet, "B49", "=J8"); body(sheet, "A46:B49"); sheet.getRange("A46:B49").format.borders = { preset: "all", style: "thin", color: C.line }; sheet.getRange("B46:B49").setNumberFormat("#,##0.00;[Red](#,##0.00);-");
 
   section(sheet, "A51:P51"); sheet.getRange("A51").values = [["Notes:"]]; sheet.getRange("A51:P51").merge();
   const sourceNotes = [
@@ -255,9 +299,10 @@ const sapRefs = {};
     "2. 发货对账结果使用“收款金额、实际数量”，仅纳入对账状态=对账成功；与OMS按月份+店铺/客户编码+货品/商品编码核对。客户确认共同键差异由跨期结算导致，原始金额保留，跨期差异通过桥接调整列示。",
     `3. 发货对账—OMS月结当前资料范围：${settlementRangeNote}。所有对账记录统一按原始字段“账期结束日期”归属结算月；6月末D-1/D-2记录即使在7月初完成对账仍纳入，账期结束在2025年12月或2026年7月的记录作为审计期外数据不纳入。`,
     "4. 跨期调整金额=OMS共同键金额-发货对账原共同键金额（仅限具备跨期证据的共同键）；调整后差异=前项匹配金额-后项调整后匹配金额；金额/数量匹配率=双方较小值÷较大值。",
-    "5. 惠策账单—旺店通订单及2025年12月Cut-off追溯不纳入SAP—OMS—发货对账主链，统一放在本页“订单-账单 稽核”区域。",
+    "5. 发货对账—惠策账单仅使用双方原始字段“平台订单号”连接，金额比较双方对账成功范围；惠策账单无原生商品数量，因此本层不执行数量核对。",
+    "6. 惠策账单—旺店通订单及2025年12月Cut-off追溯不纳入SAP—OMS—发货对账—惠策主链，统一放在本页“订单-账单 稽核”区域。",
   ];
-  sourceNotes.forEach((note, i) => { const r = 52 + i; sheet.getRange(`A${r}:P${r}`).merge(); sheet.getRange(`A${r}`).values = [[note]]; }); body(sheet, "A52:P56"); sheet.getRange("A52:P56").format.wrapText = true; sheet.getRange("A52:P56").format.rowHeight = 31;
+  sourceNotes.forEach((note, i) => { const r = 52 + i; sheet.getRange(`A${r}:P${r}`).merge(); sheet.getRange(`A${r}`).values = [[note]]; }); body(sheet, "A52:P57"); sheet.getRange("A52:P57").format.wrapText = true; sheet.getRange("A52:P57").format.rowHeight = 31;
 
   const flowGroups = [["A", "B"], ["C", "E"], ["F", "G"], ["H", "I"], ["J", "K"], ["L", "M"], ["N", "N"], ["O", "P"]];
   const setFlowRow = (row, values) => { flowGroups.forEach(([start, end], index) => { const range = `${start}${row}:${end}${row}`; if (start !== end) sheet.getRange(range).merge(); sheet.getRange(`${start}${row}`).values = [[values[index]]]; }); };
@@ -265,24 +310,26 @@ const sapRefs = {};
   setFlowRow(60, ["业务步骤", "数据来源及字段", "匹配字段/维度", "验证范围", "金额匹配率", "数量匹配率", "覆盖率", "核对结论"]); header(sheet, "A60:P60"); sheet.getRange("A60:P60").format.rowHeight = 34;
   setFlowRow(61, ["1.SAP开票 → OMS月结Y001", "SAP：含税金额/开票数量；OMS：share_amount/item_num", "OMS销售单号+物料编码+销售单位", "2026年1—6月", null, null, null, "逐条共同键核对；详见2.OMS月结-SAP汇总"]);
   setFlowRow(62, ["2.OMS月结Y001 → 发货对账结果", "OMS：share_amount/item_num；发货对账：收款金额/实际数量", "月份+客户/店铺编码+商品/货品编码", `资料齐备范围：${availableMonthsLabel}`, null, null, null, hasPendingSettlementMonths ? `${pendingMonthsLabel}待获取发货对账明细` : "1—6月均已完成核对"]);
-  setFlowRow(63, ["补充稽核：惠策账单 → 旺店通订单", "惠策：收款金额-退款金额；旺店通：allocated_total/订单头金额", "平台订单号；金额一致范围", "2026正式范围及2025年12月Cut-off", "见本页上方", "见本页上方", "见本页上方", "不纳入SAP—OMS—发货对账主链"]);
-  formula(sheet, "J61", "=K6"); formula(sheet, "L61", "=K12"); formula(sheet, "N61", "=L6"); formula(sheet, "J62", "=K7"); formula(sheet, "L62", "=K13"); formula(sheet, "N62", "=L7");
-  body(sheet, "A61:P63"); sheet.getRange("A61:P63").format.borders = { preset: "all", style: "thin", color: C.line }; sheet.getRange("A61:P63").format.wrapText = true; sheet.getRange("A61:P63").format.rowHeight = 62; for (const c of ["J", "L", "N"]) sheet.getRange(`${c}61:${c}62`).setNumberFormat("0.00%"); sheet.getRange("A61:P62").format.fill = C.green; sheet.getRange("A63:P63").format.fill = C.amber;
+  setFlowRow(63, ["3.发货对账结果 → 惠策账单", "发货对账：收款金额；惠策：收款金额-退款金额；双方仅取对账成功", "双方原始平台订单号；订单汇总金额差≤0.01元", "2026年1—6月发货对账成功范围", null, "N/A（惠策无原生商品数量）", null, "订单级金额核对；详见5.对账结果-惠策汇总"]);
+  setFlowRow(64, ["补充稽核：惠策账单 → 旺店通订单", "惠策：收款金额-退款金额；旺店通：allocated_total/订单头金额", "平台订单号；金额一致范围", "2026正式范围及2025年12月Cut-off", "见本页上方", "见本页上方", "见本页上方", "不纳入SAP—OMS—发货对账—惠策主链"]);
+  formula(sheet, "J61", "=M6"); formula(sheet, "L61", "=K12"); formula(sheet, "N61", "=N6"); formula(sheet, "J62", "=M7"); formula(sheet, "L62", "=K13"); formula(sheet, "N62", "=N7"); formula(sheet, "J63", "=M8"); formula(sheet, "N63", "=N8");
+  body(sheet, "A61:P64"); sheet.getRange("A61:P64").format.borders = { preset: "all", style: "thin", color: C.line }; sheet.getRange("A61:P64").format.wrapText = true; sheet.getRange("A61:P64").format.rowHeight = 62; for (const c of ["J", "L", "N"]) sheet.getRange(`${c}61:${c}63`).setNumberFormat("0.00%"); sheet.getRange("A61:P63").format.fill = C.green; sheet.getRange("A64:P64").format.fill = C.amber;
 
   section(sheet, "A66:P66"); sheet.getRange("A66").values = [["业务流信息（供财务人员理解）"]]; sheet.getRange("A66:P66").merge();
   const businessNotes = [
     "1. SAP标准发票（2C）作为财务确认端，OMS月结Y001作为结算执行端，发货对账结果作为平台结算中心核销成功明细的穿透支持。",
-    "2. 发货对账结果与OMS月结按月、客户/店铺编码及物料编码汇总核对，可同时验证收款金额和实际数量；该链路替代原惠策账单—OMS月结在主底稿中的位置。",
-    "3. 惠策账单与旺店通订单仍用于订单来源追溯和Cut-off敏感性分析，已放在本页数量核对下方的“订单-账单 稽核”，但不与主链金额强制串联。",
-    `4. ${hasPendingSettlementMonths ? `待取得${pendingMonthsLabel}发货对账明细后` : "后续如取得补充对账明细"}，只需放入约定目录并重新运行一键构建程序，月份行、资料范围、汇总金额及明细将自动刷新。`,
+    "2. 发货对账结果与OMS月结按月、客户/店铺编码及物料编码汇总核对，可同时验证收款金额和实际数量。",
+    "3. 发货对账结果与惠策账单按平台订单号核对双方对账成功金额；惠策没有商品数量字段，因此本层只形成订单号覆盖及金额一致性结论。",
+    "4. 惠策账单与旺店通订单仍用于订单来源追溯和Cut-off敏感性分析，已放在本页数量核对下方的“订单-账单 稽核”，不与主链金额强制串联。",
+    `5. ${hasPendingSettlementMonths ? `待取得${pendingMonthsLabel}发货对账明细后` : "后续如取得补充对账明细"}，只需放入约定目录并重新运行一键构建程序，月份行、资料范围、汇总金额及明细将自动刷新。`,
   ];
-  businessNotes.forEach((note, index) => { const row = 67 + index; sheet.getRange(`A${row}:P${row}`).merge(); sheet.getRange(`A${row}`).values = [[note]]; }); body(sheet, "A67:P70"); sheet.getRange("A67:P70").format.wrapText = true; sheet.getRange("A67:P70").format.rowHeight = 35;
+  businessNotes.forEach((note, index) => { const row = 67 + index; sheet.getRange(`A${row}:P${row}`).merge(); sheet.getRange(`A${row}`).values = [[note]]; }); body(sheet, "A67:P71"); sheet.getRange("A67:P71").format.wrapText = true; sheet.getRange("A67:P71").format.rowHeight = 35;
   [34, 38, 40, 20, 20, 20, 20, 20, 20, 22, 17, 17, 18, 18, 18, 28].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.freezePanes.freezeRows(5);
 }
 
 // 正式范围旺店通订单明细：总览保留控制数、规则及全量分片索引；完整记录存放于同目录CSV分片。
 {
-  const sheet = ws("7.旺店通订单匹配明细");
+  const sheet = ws("9.旺店通订单匹配明细");
   title(sheet, "2026年度正式范围旺店通订单匹配明细", "惠策账单明细表 ↔ 旺店通订单清单；仅含2026年度正式范围，2025年12月Cut-off扩展数据未纳入本明细。", "H");
   const categoryMap = Object.fromEntries((formalDetailManifest.categories || []).map(item => [item.category, item]));
   const matched = categoryMap["可匹配条目"] || {};
@@ -335,10 +382,23 @@ const sapRefs = {};
 }
 
 // 精简后的支持页：只保留与最终口径直接相关的字段。
-detail("9.惠策内部核对明细", "惠策明细—惠策店铺汇总实际实收核对明细", "按结算月份+平台+店铺逐项核对实际实收金额。", data.internal, { huice_shop: 34, result: 20 }, ["detail_success_amount", "summary_success_amount", "success_difference", "detail_receivable", "summary_receivable", "receivable_difference", "historical_rows", "historical_receivable", "historical_cash"]);
 detail("4.对账结果-OMS月结明细", "发货对账结果—OMS月结Y001核对明细", `原始金额、跨期调整及调整后金额并列展示；客户确认跨期结算差异已作桥接调整；${settlementRangeNote}。`, settlementDetail, { wdt_shop_name: 34, oms_customer_name: 40, material_code: 18, result: 24, source_files: 44, settlement_periods: 32, business_months: 22, cross_period_flag: 18, adjustment_basis: 46, cross_period_adjustment_amount: 20, adjusted_reconciliation_amount: 20, adjusted_amount_difference: 20, adjusted_amount_match_rate: 18 }, []);
 {
-  const sheet = ws("6.数量核对明细"); title(sheet, "销售数量逐层核对明细", "Step 1为OMS月结—发货对账结果；Step 2为OMS—SAP共同键核对。", "L");
+  const sheet = ws("6.对账结果-惠策明细");
+  title(sheet, "发货对账结果—惠策账单差异及单边明细", `按平台订单号汇总比较双方对账成功金额；Sheet展示前${(settlementHuiceException.preview_limit || 0).toLocaleString("zh-CN")}条，完整差异及单边记录见同目录CSV；惠策无原生商品数量，本层不执行数量核对。`, "P");
+  section(sheet, "A4:P4"); sheet.getRange("A4").values = [["明细控制数"]]; sheet.getRange("A4:P4").merge();
+  write(sheet, 4, 0, [["核对结果", "平台订单数", "发货对账成功金额", "惠策对账成功实际实收", "差异金额", "金额匹配率", "完整明细文件", "说明"]]); header(sheet, "A5:H5");
+  const controlRows = settlementHuiceCategories.map(x => [x.result, x.order_count || 0, x.settlement_amount || 0, x.huice_success_cash || 0, x.amount_difference || 0, x.amount_match_rate ?? null, x.result === "金额一致" ? "不输出明细" : settlementHuiceException.file || "差异及单边CSV", x.result === "金额一致" ? "汇总控制数" : "下方为差异及单边明细预览"]);
+  write(sheet, 5, 0, controlRows); const controlFirst = 6, controlLast = 5 + Math.max(1, controlRows.length); body(sheet, `A6:H${controlLast}`); status(sheet, `A6:A${controlLast}`); sheet.getRange(`B6:B${controlLast}`).setNumberFormat("#,##0"); sheet.getRange(`C6:E${controlLast}`).setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange(`F6:F${controlLast}`).setNumberFormat("0.00%"); sheet.getRange(`A6:H${controlLast}`).format.wrapText = true;
+  const detailSection = controlLast + 2; const detailHeader = detailSection + 1; const detailStart = detailHeader + 1;
+  section(sheet, `A${detailSection}:P${detailSection}`); sheet.getRange(`A${detailSection}`).values = [[`差异及单边明细预览｜完整${(settlementHuiceException.row_count || 0).toLocaleString("zh-CN")}条，当前展示前${(settlementHuiceException.preview_rows || []).length.toLocaleString("zh-CN")}条`]]; sheet.getRange(`A${detailSection}:P${detailSection}`).merge();
+  const fields = settlementHuiceExceptionDataset.headers; write(sheet, detailHeader - 1, 0, [fields.map(h => headerZh[h] ? `${h}\n${headerZh[h]}` : h)]); header(sheet, `A${detailHeader}:P${detailHeader}`); sheet.getRange(`A${detailHeader}:P${detailHeader}`).format.rowHeight = 38;
+  for (let i = 0; i < settlementHuiceExceptionDataset.rows.length; i += 3000) write(sheet, detailStart - 1 + i, 0, settlementHuiceExceptionDataset.rows.slice(i, i + 3000));
+  const detailEnd = detailStart + settlementHuiceExceptionDataset.rows.length - 1; if (settlementHuiceExceptionDataset.rows.length) { body(sheet, `A${detailStart}:P${detailEnd}`); status(sheet, `A${detailStart}:A${detailEnd}`); sheet.getRange(`B${detailStart}:B${detailEnd}`).setNumberFormat("@"); sheet.getRange(`G${detailStart}:J${detailEnd}`).setNumberFormat("#,##0"); sheet.getRange(`K${detailStart}:N${detailEnd}`).setNumberFormat("#,##0.00;[Red](#,##0.00);-"); sheet.getRange(`O${detailStart}:O${detailEnd}`).setNumberFormat("0.00%"); }
+  [18, 30, 20, 20, 24, 34, 18, 16, 16, 16, 22, 22, 22, 22, 17, 48].forEach((w, i) => sheet.getRange(`${col(i)}:${col(i)}`).format.columnWidth = w); sheet.freezePanes.freezeRows(detailHeader); sheet.freezePanes.freezeColumns(2);
+}
+{
+  const sheet = ws("8.数量核对明细"); title(sheet, "销售数量逐层核对明细", "Step 1为OMS月结—发货对账结果；Step 2为OMS—SAP共同键核对。", "L");
   const select = (dataset, fields) => { const indexes = fields.map(h => dataset.headers.indexOf(h)); return dataset.rows.map(row => indexes.map(i => row[i])); };
   const step1Fields = ["month", "shop_customer_code", "wdt_shop_name", "oms_customer_name", "material_code", "reconciliation_quantity", "oms_quantity", "quantity_difference", "quantity_match_rate", "result"];
   const step1Rows = select(settlementDetail, step1Fields); section(sheet, "A4:J4"); sheet.getRange("A4").values = [["Step 1｜OMS月结数量 vs 发货对账实际数量"]]; sheet.getRange("A4:J4").merge(); write(sheet, 4, 0, [step1Fields.map(h => headerZh[h] ? `${h}\n${headerZh[h]}` : h)]); header(sheet, "A5:J5"); sheet.getRange("A5:J5").format.rowHeight = 36;
@@ -354,11 +414,12 @@ detail("10.店铺客户映射", "惠策店铺—OMS客户映射", "仅展示店�
 await fs.mkdir(outputDir, { recursive: true });
 const previews = path.join(root, "reconciliation/qa_previews"); await fs.mkdir(previews, { recursive: true });
 console.log("OVERVIEW\n" + (await wb.inspect({ kind: "table", range: "1.全局口径与总览!A1:P82", include: "values,formulas", tableMaxRows: 84, tableMaxCols: 17, maxChars: 82000 })).ndjson);
-console.log("HUICE_INTERNAL\n" + (await wb.inspect({ kind: "table", range: "8.惠策内部核对汇总!A1:H16", include: "values,formulas", tableMaxRows: 18, tableMaxCols: 9, maxChars: 12000 })).ndjson);
 console.log("SETTLEMENT_OMS\n" + (await wb.inspect({ kind: "table", range: "3.对账结果-OMS月结汇总!A1:O18", include: "values,formulas", tableMaxRows: 20, tableMaxCols: 16, maxChars: 28000 })).ndjson);
-console.log("FORMAL_ORDER_DETAIL\n" + (await wb.inspect({ kind: "table", range: "7.旺店通订单匹配明细!A1:H34", include: "values,formulas", tableMaxRows: 36, tableMaxCols: 9, maxChars: 18000 })).ndjson);
+console.log("SETTLEMENT_HUICE\n" + (await wb.inspect({ kind: "table", range: "5.对账结果-惠策汇总!A1:I24", include: "values,formulas", tableMaxRows: 26, tableMaxCols: 10, maxChars: 24000 })).ndjson);
+console.log("SETTLEMENT_HUICE_DETAIL\n" + (await wb.inspect({ kind: "table", range: "6.对账结果-惠策明细!A1:P20", include: "values,formulas", tableMaxRows: 22, tableMaxCols: 17, maxChars: 28000 })).ndjson);
+console.log("FORMAL_ORDER_DETAIL\n" + (await wb.inspect({ kind: "table", range: "9.旺店通订单匹配明细!A1:H34", include: "values,formulas", tableMaxRows: 36, tableMaxCols: 9, maxChars: 18000 })).ndjson);
 console.log("ERRORS\n" + (await wb.inspect({ kind: "match", searchTerm: "#REF!|#DIV/0!|#VALUE!|#NAME\\?|#N/A", options: { useRegex: true, maxResults: 300 }, summary: "formula errors", maxChars: 5000 })).ndjson);
-for (const name of names) { const sheet = ws(name), used = sheet.getUsedRange(true), maxCols = Math.min(used.columnCount || 8, name === "1.全局口径与总览" ? 16 : name === "3.对账结果-OMS月结汇总" ? 15 : name.includes("明细") || name.includes("映射") ? 10 : 12), maxRows = name === "1.全局口径与总览" ? 82 : name.includes("明细") ? 20 : 30; const blob = await wb.render({ sheetName: name, range: `A1:${col(maxCols - 1)}${maxRows}`, scale: 1.15, format: "png" }); await fs.writeFile(path.join(previews, `${name}.png`), new Uint8Array(await blob.arrayBuffer())); }
+for (const name of names) { const sheet = ws(name), used = sheet.getUsedRange(true), maxCols = Math.min(used.columnCount || 8, name === "1.全局口径与总览" || name === "6.对账结果-惠策明细" ? 16 : name === "3.对账结果-OMS月结汇总" ? 15 : name.includes("明细") || name.includes("映射") ? 10 : 12), maxRows = name === "1.全局口径与总览" ? 82 : name.includes("明细") ? 20 : 30; const blob = await wb.render({ sheetName: name, range: `A1:${col(maxCols - 1)}${maxRows}`, scale: 1.15, format: "png" }); await fs.writeFile(path.join(previews, `${name}.png`), new Uint8Array(await blob.arrayBuffer())); }
 const adjustmentPreview = await wb.render({ sheetName: "4.对账结果-OMS月结明细", range: "I1:Y20", scale: 1.15, format: "png" }); await fs.writeFile(path.join(previews, "4.对账结果-OMS月结明细-跨期调整.png"), new Uint8Array(await adjustmentPreview.arrayBuffer()));
-const qtyStep2Section = 7 + settlementDetail.rows.length; const qtyStep2Preview = await wb.render({ sheetName: "6.数量核对明细", range: `A${qtyStep2Section}:L${qtyStep2Section + 17}`, scale: 1.15, format: "png" }); await fs.writeFile(path.join(previews, "6.数量核对明细-Step2.png"), new Uint8Array(await qtyStep2Preview.arrayBuffer()));
+const qtyStep2Section = 7 + settlementDetail.rows.length; const qtyStep2Preview = await wb.render({ sheetName: "8.数量核对明细", range: `A${qtyStep2Section}:L${qtyStep2Section + 17}`, scale: 1.15, format: "png" }); await fs.writeFile(path.join(previews, "8.数量核对明细-Step2.png"), new Uint8Array(await qtyStep2Preview.arrayBuffer()));
 const out = await SpreadsheetFile.exportXlsx(wb); await out.save(outputFile); console.log(JSON.stringify({ outputFile, sheets: names, previews }, null, 2));

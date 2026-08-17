@@ -35,6 +35,17 @@ from oms_transaction_codes import OMS_CODE_MAP, SOURCE_FILE as OMS_CODE_SOURCE
 
 HUICE_SUPPLEMENT_FILE = "历史账期对账结果明细6月-3.xlsx"
 
+# 客户确认的SAP录入更正：仅修正用于OMS—SAP钩稽的销售单号，
+# 原始SAP文件保持不变，并在sap_oms_sales_no_correction_log中保留审计轨迹。
+SAP_OMS_SALES_NO_CORRECTIONS = {
+    "Y83078d072e7ac5620e599_1": "Y83078d072e7ac5620e599",
+}
+
+
+def correct_sap_oms_sales_no(value: Optional[str]) -> str:
+    raw_value = value or ""
+    return SAP_OMS_SALES_NO_CORRECTIONS.get(raw_value, raw_value)
+
 
 def huice_detail_files(input_dir: Path) -> List[Path]:
     """Return regular Huice exports first and the late-arriving supplement last.
@@ -1095,12 +1106,24 @@ def materialize_analysis_tables(connection: sqlite3.Connection) -> None:
           ON s.reconcile_date=r.reconcile_date AND s.platform=r.platform AND s.shop=r.shop
         WHERE s.shop IS NULL;
 
+        DROP TABLE IF EXISTS sap_oms_sales_no_correction_log;
+        CREATE TABLE sap_oms_sales_no_correction_log AS
+        SELECT oms_sales_no original_oms_sales_no,
+          correct_sap_oms_sales_no(oms_sales_no) corrected_oms_sales_no,
+          GROUP_CONCAT(DISTINCT sap_invoice_no) sap_invoice_nos,
+          SUM(row_count) affected_rows,SUM(invoice_qty) affected_quantity,
+          SUM(tax_amount) affected_amount,
+          '客户确认：SAP的OMS销售单号录入错误' correction_basis
+        FROM sap2c
+        WHERE correct_sap_oms_sales_no(oms_sales_no)<>oms_sales_no
+        GROUP BY oms_sales_no,correct_sap_oms_sales_no(oms_sales_no);
+
         DROP TABLE IF EXISTS sap2c_key;
         CREATE TABLE sap2c_key AS
-        SELECT oms_sales_no,material_code,sales_unit,
+        SELECT correct_sap_oms_sales_no(oms_sales_no) oms_sales_no,material_code,sales_unit,
           SUM(invoice_qty) invoice_qty,SUM(tax_amount) sap_amount,SUM(net_amount) sap_net_amount,SUM(tax_value) sap_tax,
           SUM(row_count) sap_rows,MIN(file_month) file_month,GROUP_CONCAT(DISTINCT sap_invoice_no) sap_invoice_nos
-        FROM sap2c GROUP BY oms_sales_no,material_code,sales_unit;
+        FROM sap2c GROUP BY correct_sap_oms_sales_no(oms_sales_no),material_code,sales_unit;
         CREATE INDEX IF NOT EXISTS idx_sap_doc ON sap2c_key(oms_sales_no);
 
         DROP TABLE IF EXISTS oms_key;
@@ -1284,6 +1307,11 @@ def build_summary(connection: sqlite3.Connection, output_dir: Path) -> Dict:
         "SELECT COUNT(*),SUM(CASE WHEN mapping_status='自动高置信' THEN 1 ELSE 0 END),SUM(CASE WHEN mapping_status='未映射' THEN 1 ELSE 0 END) FROM customer_shop_map",
     )
 
+    correction_log = rows_as_dicts(
+        connection,
+        "SELECT * FROM sap_oms_sales_no_correction_log ORDER BY original_oms_sales_no",
+    )
+
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "parameters": {
@@ -1330,6 +1358,7 @@ def build_summary(connection: sqlite3.Connection, output_dir: Path) -> Dict:
         "huice_summary_recon": huice_summary_status,
         "oms_sap_summary": oms_sap_status,
         "oms_huice_summary": oms_huice_status,
+        "sap_oms_sales_no_corrections": correction_log,
         "detail_exports": detail_exports,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1351,6 +1380,12 @@ def main() -> None:
     if args.rebuild and database_path.exists():
         database_path.unlink()
     connection = sqlite3.connect(database_path)
+    connection.create_function(
+        "correct_sap_oms_sales_no",
+        1,
+        correct_sap_oms_sales_no,
+        deterministic=True,
+    )
     configure_database(connection)
     create_schema(connection)
     ensure_wdt_order_composite_key(connection)

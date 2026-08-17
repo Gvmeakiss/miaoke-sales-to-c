@@ -183,49 +183,6 @@ def build(conn: sqlite3.Connection) -> None:
     FROM (SELECT * FROM base_summary UNION ALL SELECT * FROM supplement_summary)
     GROUP BY bill_month,platform,huice_shop;
 
-    -- 惠策明细与店铺汇总必须使用相同的“导出结算月份”口径核对。
-    -- 业务日期可落在往期，若按业务日期过滤会把汇总中合法的往期回款排除。
-    DROP TABLE IF EXISTS v4_huice_detail_settlement;
-    CREATE TABLE v4_huice_detail_settlement AS
-    SELECT CASE WHEN h.source_file='{HUICE_SUPPLEMENT_FILE}' THEN '2026-06'
-                WHEN h.source_file LIKE '%1月%' THEN '2026-01' WHEN h.source_file LIKE '%2月%' THEN '2026-02'
-                WHEN h.source_file LIKE '%3月%' THEN '2026-03' WHEN h.source_file LIKE '%4月%' THEN '2026-04'
-                WHEN h.source_file LIKE '%5月%' THEN '2026-05' WHEN h.source_file LIKE '%6月%' THEN '2026-06' END bill_month,
-      h.platform,h.shop huice_shop,COUNT(*) detail_rows,
-      SUM(CASE WHEN h.reconcile_status='对账成功' THEN c.current_receivable ELSE 0 END) detail_success_amount,
-      SUM(c.current_receivable) detail_receivable,SUM(c.current_cash) detail_cash,
-      SUM(CASE WHEN h.source_file<>'{HUICE_SUPPLEMENT_FILE}' AND COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN 1 ELSE 0 END) historical_rows,
-      SUM(CASE WHEN h.source_file<>'{HUICE_SUPPLEMENT_FILE}' AND COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN c.current_receivable ELSE 0 END) historical_receivable,
-      SUM(CASE WHEN h.source_file<>'{HUICE_SUPPLEMENT_FILE}' AND COALESCE(NULLIF(h.business_date,''),h.period_end)<'{REPORT_START}' THEN c.current_cash ELSE 0 END) historical_cash
-    FROM huice_detail h JOIN huice_current_amount c ON c.reconcile_id=h.reconcile_id
-    WHERE h.source_file='{HUICE_SUPPLEMENT_FILE}' OR h.source_file LIKE '%1月%' OR h.source_file LIKE '%2月%' OR h.source_file LIKE '%3月%'
-       OR h.source_file LIKE '%4月%' OR h.source_file LIKE '%5月%' OR h.source_file LIKE '%6月%'
-    GROUP BY 1,2,3;
-
-    DROP TABLE IF EXISTS v4_huice_internal_recon;
-    CREATE TABLE v4_huice_internal_recon AS
-    SELECT d.bill_month,d.platform,d.huice_shop,d.detail_rows,COALESCE(s.source_rows,0) summary_rows,
-      d.detail_success_amount,COALESCE(s.bill_success_amount,0) summary_success_amount,
-      COALESCE(s.bill_success_amount,0)-d.detail_success_amount success_difference,
-      d.detail_receivable,COALESCE(s.bill_receivable,0) summary_receivable,
-      COALESCE(s.bill_receivable,0)-d.detail_receivable receivable_difference,
-      d.detail_cash,COALESCE(s.bill_cash,0) summary_cash,
-      COALESCE(s.bill_cash,0)-d.detail_cash cash_difference,
-      d.historical_rows,d.historical_receivable,d.historical_cash,
-      CASE WHEN s.huice_shop IS NULL THEN '仅惠策明细'
-           WHEN ABS(s.bill_cash-d.detail_cash)<=0.01 THEN '实收一致'
-           ELSE '实收差异' END result
-    FROM v4_huice_detail_settlement d LEFT JOIN v4_huice_shop_bill s
-      ON s.bill_month=d.bill_month AND s.platform=d.platform AND s.huice_shop=d.huice_shop
-    UNION ALL
-    SELECT s.bill_month,s.platform,s.huice_shop,0,s.source_rows,
-      0,s.bill_success_amount,s.bill_success_amount,
-      0,s.bill_receivable,s.bill_receivable,
-      0,s.bill_cash,s.bill_cash,0,0,0,'仅店铺汇总'
-    FROM v4_huice_shop_bill s LEFT JOIN v4_huice_detail_settlement d
-      ON d.bill_month=s.bill_month AND d.platform=s.platform AND d.huice_shop=s.huice_shop
-    WHERE d.huice_shop IS NULL;
-
     DROP TABLE IF EXISTS v4_huice_shop_map;
     DROP TABLE IF EXISTS v4_huice_name_override;
     CREATE TABLE v4_huice_name_override(
@@ -433,13 +390,12 @@ def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
     OUT.mkdir(parents=True, exist_ok=True)
     queries = {
         "order_bill_recon": "SELECT * FROM v4_order_bill_recon ORDER BY CASE WHEN result LIKE '%一致' AND result<>'单号一致金额差异' THEN 3 ELSE 1 END,result,platform_order_no",
-        "huice_internal_recon": "SELECT * FROM v4_huice_internal_recon ORDER BY CASE result WHEN '应收实收一致' THEN 2 ELSE 1 END,result,bill_month,platform,huice_shop",
         "bill_oms_month_recon": "SELECT * FROM v4_bill_oms_month_recon ORDER BY CASE result WHEN '成功金额一致' THEN 3 WHEN '应收金额一致' THEN 3 WHEN '实收金额一致' THEN 3 WHEN 'SAP辅助金额一致' THEN 3 ELSE 1 END,result,bill_month,huice_shop",
         "order_bill_oms_qty_recon": "SELECT * FROM v4_order_bill_oms_qty_recon ORDER BY CASE result WHEN '数量一致' THEN 3 ELSE 1 END,result,ship_month,wdt_shop,material_code",
         "oms_sap_field_map": "SELECT * FROM v4_oms_sap_field_map ORDER BY CASE mapping_result WHEN '双向字段一致' THEN 2 ELSE 1 END,mapping_result,outbound_month,oms_sales_no,material_code",
         "huice_shop_map": "SELECT * FROM v4_huice_shop_map ORDER BY mapping_status,bill_month,platform,huice_shop",
     }
-    limits = {"order_bill_recon":18000,"huice_internal_recon":20000,"bill_oms_month_recon":20000,"order_bill_oms_qty_recon":20000,"oms_sap_field_map":20000,"huice_shop_map":20000}
+    limits = {"order_bill_recon":18000,"bill_oms_month_recon":20000,"order_bill_oms_qty_recon":20000,"oms_sap_field_map":20000,"huice_shop_map":20000}
     for name, query in queries.items() if write_details else []:
         cursor = conn.execute(query)
         headers = [column[0] for column in cursor.description]
@@ -490,8 +446,7 @@ def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
         "order_lookup_start": ORDER_LOOKBACK_START,
         "order_lookup_end": "2026-06-30",
         "order_bill_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(wdt_qty) wdt_qty,SUM(wdt_header_amount) wdt_header_amount,SUM(wdt_amount) wdt_amount,SUM(bill_receivable) bill_receivable,SUM(bill_cash) bill_cash FROM v4_order_bill_recon GROUP BY result ORDER BY groups DESC"),
-        "huice_internal_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(detail_rows) detail_rows,SUM(summary_rows) summary_rows,SUM(detail_receivable) detail_receivable,SUM(summary_receivable) summary_receivable,SUM(receivable_difference) receivable_difference,SUM(detail_cash) detail_cash,SUM(summary_cash) summary_cash,SUM(cash_difference) cash_difference FROM v4_huice_internal_recon GROUP BY result ORDER BY groups DESC"),
-        "huice_internal_monthly": dict_rows(conn,"SELECT bill_month,SUM(detail_rows) detail_rows,SUM(summary_rows) summary_rows,SUM(detail_receivable) detail_receivable,SUM(summary_receivable) summary_receivable,SUM(receivable_difference) receivable_difference,SUM(detail_cash) detail_cash,SUM(summary_cash) summary_cash,SUM(cash_difference) cash_difference,SUM(historical_rows) historical_rows,SUM(historical_receivable) historical_receivable,SUM(historical_cash) historical_cash FROM v4_huice_internal_recon GROUP BY bill_month ORDER BY bill_month"),
+        "sap_oms_sales_no_corrections": dict_rows(conn,"SELECT * FROM sap_oms_sales_no_correction_log ORDER BY original_oms_sales_no"),
         "bill_oms_period_customer": dict_rows(conn,"SELECT * FROM v4_bill_oms_period_customer ORDER BY ABS(period_difference) DESC"),
         "qty_customer_month": dict_rows(conn,"SELECT * FROM v4_qty_customer_month_recon ORDER BY cross_material_offset DESC"),
         "bill_oms_results": dict_rows(conn,"SELECT result,COUNT(*) groups,SUM(bill_record_count) bill_records,SUM(bill_success_amount) bill_success_amount,SUM(bill_receivable) bill_receivable,SUM(bill_cash) bill_cash,SUM(oms_qty) oms_qty,SUM(oms_amount) oms_amount,SUM(sap_assisted_qty) sap_assisted_qty,SUM(sap_assisted_amount) sap_assisted_amount FROM v4_bill_oms_month_recon GROUP BY result ORDER BY groups DESC"),
@@ -536,14 +491,6 @@ def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
             "huice_bill_success_amount": scalar(conn,"SELECT SUM(bill_success_amount) FROM v4_huice_shop_bill"),
             "huice_bill_receivable": scalar(conn,"SELECT SUM(bill_receivable) FROM v4_huice_shop_bill"),
             "huice_bill_cash": scalar(conn,"SELECT SUM(bill_cash) FROM v4_huice_shop_bill"),
-            "huice_detail_settlement_rows": scalar(conn,"SELECT SUM(detail_rows) FROM v4_huice_detail_settlement"),
-            "huice_detail_settlement_receivable": scalar(conn,"SELECT SUM(detail_receivable) FROM v4_huice_detail_settlement"),
-            "huice_detail_settlement_cash": scalar(conn,"SELECT SUM(detail_cash) FROM v4_huice_detail_settlement"),
-            "huice_internal_receivable_difference": scalar(conn,"SELECT SUM(receivable_difference) FROM v4_huice_internal_recon"),
-            "huice_internal_cash_difference": scalar(conn,"SELECT SUM(cash_difference) FROM v4_huice_internal_recon"),
-            "huice_historical_rows": scalar(conn,"SELECT SUM(historical_rows) FROM v4_huice_detail_settlement"),
-            "huice_historical_receivable": scalar(conn,"SELECT SUM(historical_receivable) FROM v4_huice_detail_settlement"),
-            "huice_historical_cash": scalar(conn,"SELECT SUM(historical_cash) FROM v4_huice_detail_settlement"),
             "oms_month_docs": scalar(conn,"SELECT SUM(oms_docs) FROM v4_oms_month_shop"),
             "oms_month_qty": scalar(conn,"SELECT SUM(oms_qty) FROM v4_oms_month_shop"),
             "oms_month_amount": scalar(conn,"SELECT SUM(oms_amount) FROM v4_oms_month_shop"),
@@ -564,8 +511,6 @@ def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
             "order_amount_exact_groups": scalar(conn,"SELECT COUNT(*) FROM v4_order_bill_recon WHERE result IN ('单号分摊应收一致','单号分摊实收一致','单号订单应收一致','单号订单实收一致')"),
             "order_allocated_exact_groups": scalar(conn,"SELECT COUNT(*) FROM v4_order_bill_recon WHERE result IN ('单号分摊应收一致','单号分摊实收一致')"),
             "order_header_fallback_exact_groups": scalar(conn,"SELECT COUNT(*) FROM v4_order_bill_recon WHERE result IN ('单号订单应收一致','单号订单实收一致')"),
-            "huice_internal_exact_groups": scalar(conn,"SELECT COUNT(*) FROM v4_huice_internal_recon WHERE result='应收实收一致'"),
-            "huice_internal_total_groups": scalar(conn,"SELECT COUNT(*) FROM v4_huice_internal_recon"),
             "bill_exact_groups": scalar(conn,"SELECT COUNT(*) FROM v4_bill_oms_month_recon WHERE result='成功金额一致'"),
             "bill_total_groups": scalar(conn,"SELECT COUNT(*) FROM v4_bill_oms_month_recon"),
             "bill_gross_abs_success_diff": scalar(conn,"SELECT SUM(ABS(success_difference)) FROM v4_bill_oms_month_recon"),
@@ -587,7 +532,7 @@ def export(conn: sqlite3.Connection, write_details: bool = True) -> dict:
             "qty_customer_month_gross_difference": scalar(conn,"SELECT SUM(ABS(qty_difference)) FROM v4_qty_customer_month_recon"),
             "qty_cross_material_offset": scalar(conn,"SELECT SUM(cross_material_offset) FROM v4_qty_customer_month_recon"),
         },
-        "detail_rows": {name: scalar(conn,f"SELECT COUNT(*) FROM v4_{'order_bill_recon' if name=='order_bill_recon' else 'huice_internal_recon' if name=='huice_internal_recon' else 'bill_oms_month_recon' if name=='bill_oms_month_recon' else 'order_bill_oms_qty_recon' if name=='order_bill_oms_qty_recon' else 'oms_sap_field_map' if name=='oms_sap_field_map' else 'huice_shop_map'}") for name in queries},
+        "detail_rows": {name: scalar(conn,f"SELECT COUNT(*) FROM v4_{'order_bill_recon' if name=='order_bill_recon' else 'bill_oms_month_recon' if name=='bill_oms_month_recon' else 'order_bill_oms_qty_recon' if name=='order_bill_oms_qty_recon' else 'oms_sap_field_map' if name=='oms_sap_field_map' else 'huice_shop_map'}") for name in queries},
     }
     (OUT/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     return summary
